@@ -162,193 +162,166 @@ void ProcessChanges_OpenMP(
 }
 
 
-// Algorithm 3: Parallel Update of Affected Vertices (OpenMP)
-void UpdateAffectedVertices_OpenMP(
+// Improved Algorithm 2: Mark and invalidate affected vertices after deletions
+void IdentifyAndInvalidateAffected_OpenMP(
     const Graph& G,
-    SSSPResult& T, // Pass SSSPResult by reference
-    std::vector<std::atomic<bool>>& Affected_Del,
+    SSSPResult& T,
+    const std::vector<EdgeChange>& changes,
     std::vector<std::atomic<bool>>& Affected
 ) {
     int n = G.num_vertices;
-    std::atomic<bool> changed_del(true); // Use atomic for loop control
-
-    // Phase 1: Propagate Deletions (Setting distances to infinity)
-    while (changed_del.load(std::memory_order_acquire)) {
-        changed_del.store(false, std::memory_order_relaxed); // Assume no changes in this iteration
-        std::vector<int> newly_affected_del_indices;
-        // Consider reserving based on previous iteration size or a fraction of n
-        // newly_affected_del_indices.reserve(n / 10);
-
-        #pragma omp parallel
-        {
-            std::vector<int> local_newly_affected_del;
-
-            #pragma omp for nowait schedule(dynamic) // Process vertices marked for deletion propagation
-            for (int v = 0; v < n; ++v) {
-                // Use load with acquire memory order for visibility
-                if (Affected_Del[v].load(std::memory_order_acquire)) {
-                    // Use store with release memory order
-                    Affected_Del[v].store(false, std::memory_order_release); // Reset flag for next deletion iteration
-
-                    // Find children in the SSSP tree and mark them
-                    // Use the helper function
-                    for (int child : get_children(v, n, T.parent)) {
-                         // Basic bounds check
-                         if (child < 0 || child >= n) continue;
-
-                         if (T.dist[child] != INFINITY_WEIGHT) { // Avoid redundant work
-                            // This block needs atomicity if multiple parents could invalidate the same child
-                            #pragma omp critical (ChildInvalidation)
-                            {
-                                // Re-check inside critical section
-                                // Ensure the parent is still 'v' before invalidating
-                                if (T.parent[child] == v && T.dist[child] != INFINITY_WEIGHT) {
-                                     T.dist[child] = INFINITY_WEIGHT;
-                                     T.parent[child] = -1; // Reset parent
-                                     // Use relaxed memory order for flags updated within critical section
-                                     Affected[child].store(true, std::memory_order_relaxed); // Mark as generally affected for Phase 2
-                                     local_newly_affected_del.push_back(child); // Mark for next deletion round
-                                }
-                            }
-                        }
+    // Step 1: Mark directly affected vertices (those whose parent edge is deleted)
+    #pragma omp parallel for
+    for (size_t i = 0; i < changes.size(); ++i) {
+        const auto& change = changes[i];
+        if (change.is_insertion) continue; // Only process deletions
+        int u = change.u, v = change.v;
+        // If the parent of v is u, and the edge (u,v) was in the SSSP tree, mark v
+        if (T.parent[v] == u && !G.has_edge(u, v)) {
+            Affected[v] = true;
+            T.dist[v] = INFINITY_WEIGHT;
+            T.parent[v] = -1;
+        }
+        // If the parent of u is v, and the edge (v,u) was in the SSSP tree, mark u
+        if (T.parent[u] == v && !G.has_edge(v, u)) {
+            Affected[u] = true;
+            T.dist[u] = INFINITY_WEIGHT;
+            T.parent[u] = -1;
+        }
+    }
+    // Step 2: Propagate affected marking to descendants in the SSSP tree
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        #pragma omp parallel for
+        for (int v = 0; v < n; ++v) {
+            if (Affected[v]) {
+                for (int w = 0; w < n; ++w) {
+                    if (T.parent[w] == v && !Affected[w]) {
+                        Affected[w] = true;
+                        T.dist[w] = INFINITY_WEIGHT;
+                        T.parent[w] = -1;
+                        changed = true;
                     }
                 }
-            } // end omp for
-
-            // Collect results from local lists using a critical section
-            #pragma omp critical (CollectDeleted)
-            {
-                if (!local_newly_affected_del.empty()) {
-                    newly_affected_del_indices.insert(newly_affected_del_indices.end(),
-                                                     local_newly_affected_del.begin(),
-                                                     local_newly_affected_del.end());
-                }
-            }
-        } // end parallel region
-
-        // Mark the children collected in this pass as affected for the *next* deletion propagation pass
-        if (!newly_affected_del_indices.empty()) {
-            // Use store with release memory order
-            changed_del.store(true, std::memory_order_release); // Signal that changes occurred
-            #pragma omp parallel for schedule(static) // Static might be okay here
-            for (size_t i = 0; i < newly_affected_del_indices.size(); ++i) {
-                 int idx = newly_affected_del_indices[i];
-                 // Bounds check already done when adding to list, but double check is safe
-                 if (idx >= 0 && idx < n) {
-                    // Use store with release memory order
-                    Affected_Del[idx].store(true, std::memory_order_release);
-                 }
             }
         }
-    } // end while changed_del
-
-
-    // Phase 2: Propagate Distance Updates
-    std::atomic<bool> changed_dist(true); // Use atomic for loop control
-    while (changed_dist.load(std::memory_order_acquire)) {
-        changed_dist.store(false, std::memory_order_relaxed); // Assume no changes in this iteration
-        // Use a temporary vector for the next affected set, non-atomic initially
-        std::vector<bool> next_affected_flags(n, false);
-
-
-        #pragma omp parallel
-        {
-            bool local_changed = false; // Track changes within this thread
-
-            #pragma omp for nowait schedule(dynamic) // Iterate over potentially affected vertices
-            for (int v = 0; v < n; ++v) {
-                // Use load with acquire memory order
-                if (Affected[v].load(std::memory_order_acquire)) {
-                    // Relax outgoing edges
-                    if (T.dist[v] != INFINITY_WEIGHT) { // Only relax if source 'v' is reachable
-                        try {
-                            for (const auto& edge : G.neighbors(v)) { // Use const G.neighbors()
-                                int n_neighbor = edge.to;
-                                Weight weight = edge.weight;
-                                // Bounds check neighbor
-                                if (n_neighbor < 0 || n_neighbor >= n) continue;
-
-                                Weight new_dist = T.dist[v] + weight;
-
-                                // Use atomic compare-and-swap or critical section
-                                // Using critical section for simplicity
-                                if (new_dist < T.dist[n_neighbor]) {
-                                    #pragma omp critical (DistUpdateRelax)
-                                    {
-                                        // Re-check condition inside critical section
-                                        if (new_dist < T.dist[n_neighbor]) {
-                                            T.dist[n_neighbor] = new_dist;
-                                            T.parent[n_neighbor] = v;
-                                            // Mark in the non-atomic temporary vector first
-                                            if (!next_affected_flags[n_neighbor]) {
-                                                 next_affected_flags[n_neighbor] = true;
-                                            }
-                                            local_changed = true;
-                                        }
-                                    }
-                                }
-                            }
-                        } catch (const std::out_of_range& oor) { /* Ignore error if v is invalid */ }
-                    }
-
-                    // Relax incoming edges (Pseudocode Step: else if Dist[v] > Dist[n] + W(n, v))
-                    try {
-                        for (const auto& edge : G.neighbors(v)) { // Iterate neighbors 'n' of 'v'
-                            int n_neighbor = edge.to;
-                            Weight weight = edge.weight; // Weight(n_neighbor, v) - assuming undirected
-                            // Bounds check neighbor
-                            if (n_neighbor < 0 || n_neighbor >= n) continue;
-
-                            if (T.dist[n_neighbor] != INFINITY_WEIGHT) { // Check if neighbor 'n' is reachable
-                                Weight new_dist_v = T.dist[n_neighbor] + weight;
-                                if (new_dist_v < T.dist[v]) {
-                                    #pragma omp critical (DistUpdateRelax) // Use same critical section
-                                    {
-                                        // Re-check condition inside critical section
-                                        if (new_dist_v < T.dist[v]) {
-                                            T.dist[v] = new_dist_v;
-                                            T.parent[v] = n_neighbor;
-                                            // Mark 'v' itself in the non-atomic temporary vector
-                                             if (!next_affected_flags[v]) {
-                                                 next_affected_flags[v] = true;
-                                             }
-                                            local_changed = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                     } catch (const std::out_of_range& oor) { /* Ignore error if v is invalid */ }
-                }
-            } // end for loop
-
-            // If any thread made a change, signal the outer loop atomically
-            if (local_changed) {
-                 changed_dist.store(true, std::memory_order_relaxed); // Relaxed is fine here, check is acquire
-            }
-
-        } // end parallel region
-
-        // Update Affected flags for the next iteration based on next_affected_flags
-        #pragma omp parallel for schedule(static)
-        for(int i=0; i<n; ++i) {
-             // Use store with release memory order
-             Affected[i].store(next_affected_flags[i], std::memory_order_release);
-        }
-
-    } // end while changed_dist
+    }
 }
 
 
-// Algorithm 4: Asynchronous Update with OpenMP (Placeholder)
-void AsyncUpdate_OpenMP(
-    const std::vector<EdgeChange>& changes,
+// Algorithm 2: Parallel Identification of Affected Vertices (OpenMP)
+// Marks all vertices whose shortest path is affected by edge deletions
+void IdentifyAffectedVertices_OpenMP(
     const Graph& G,
-    SSSPResult& T // Pass SSSPResult by reference
-    // int asynchronyLevel // Parameter from pseudocode
+    const std::vector<EdgeChange>& changes, // Only deletions
+    const SSSPResult& T, // Current SSSP tree
+    std::vector<std::atomic<bool>>& Affected // Output: affected vertices
 ) {
-    std::cerr << "AsyncUpdate_OpenMP (Algorithm 4) is not fully implemented." << std::endl;
-    // Implementation depends heavily on the chosen asynchronous model (e.g., work queues, tasking).
+    int n = G.num_vertices;
+    // Step 1: Mark directly affected vertices (those whose parent edge is deleted)
+    #pragma omp parallel for
+    for (size_t i = 0; i < changes.size(); ++i) {
+        const auto& change = changes[i];
+        if (change.is_insertion) continue; // Only process deletions
+        int u = change.u, v = change.v;
+        // If the parent of v is u, and the edge (u,v) was in the SSSP tree, mark v
+        if (T.parent[v] == u) {
+            Affected[v] = true;
+        }
+        // If the parent of u is v, and the edge (v,u) was in the SSSP tree, mark u
+        if (T.parent[u] == v) {
+            Affected[u] = true;
+        }
+    }
+    // Step 2: Propagate affected marking to descendants in the SSSP tree
+    // (If a parent is affected, all its children are affected)
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        #pragma omp parallel for
+        for (int v = 0; v < n; ++v) {
+            if (Affected[v]) {
+                for (int w = 0; w < n; ++w) {
+                    if (T.parent[w] == v && !Affected[w]) {
+                        Affected[w] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+// Algorithm 3: Parallel Update of Affected Vertices (OpenMP)
+// Updates distances and parents for all affected vertices after deletions
+void UpdateAffectedVertices_OpenMP(
+    const Graph& G,
+    SSSPResult& T, // Pass SSSPResult by reference
+    std::vector<std::atomic<bool>>& Affected // Input/Output: affected vertices
+) {
+    int n = G.num_vertices;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        #pragma omp parallel for
+        for (int v = 0; v < n; ++v) {
+            if (Affected[v]) {
+                Weight min_dist = INFINITY_WEIGHT;
+                int min_parent = -1;
+                // Try to find a better path to v from its neighbors
+                for (const auto& edge : G.neighbors(v)) {
+                    int u = edge.to;
+                    if (!Affected[u] && T.dist[u] + edge.weight < min_dist) {
+                        min_dist = T.dist[u] + edge.weight;
+                        min_parent = u;
+                    }
+                }
+                if (min_dist < T.dist[v]) {
+                    T.dist[v] = min_dist;
+                    T.parent[v] = min_parent;
+                    changed = true;
+                    Affected[v] = false; // No longer affected
+                }
+            }
+        }
+    }
+}
+
+
+// Algorithm 4: Asynchronous Update of Affected Vertices (OpenMP)
+// This function performs asynchronous updates for affected vertices after deletions/insertions
+void AsyncUpdate_OpenMP(
+    const Graph& G,
+    SSSPResult& T, // Pass SSSPResult by reference
+    std::vector<std::atomic<bool>>& Affected // Input/Output: affected vertices
+) {
+    int n = G.num_vertices;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        #pragma omp parallel for schedule(dynamic)
+        for (int v = 0; v < n; ++v) {
+            if (Affected[v]) {
+                Weight min_dist = INFINITY_WEIGHT;
+                int min_parent = -1;
+                for (const auto& edge : G.neighbors(v)) {
+                    int u = edge.to;
+                    if (!Affected[u] && T.dist[u] + edge.weight < min_dist) {
+                        min_dist = T.dist[u] + edge.weight;
+                        min_parent = u;
+                    }
+                }
+                if (min_dist < T.dist[v]) {
+                    T.dist[v] = min_dist;
+                    T.parent[v] = min_parent;
+                    changed = true;
+                    Affected[v] = false;
+                }
+            }
+        }
+    }
 }
 
 
@@ -383,11 +356,38 @@ void BatchUpdate_OpenMP(
 
     // Step 2: Update distances iteratively (Algorithm 3)
     auto start_update = std::chrono::high_resolution_clock::now();
-    UpdateAffectedVertices_OpenMP(G, T, Affected_Del, Affected);
+    UpdateAffectedVertices_OpenMP(G, T, Affected);
     auto end_update = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double, std::milli> update_time = end_update - start_update;
     // std::cout << "  [OMP] UpdateAffectedVertices finished in " << update_time.count() << " ms." << std::endl;
 
 
     // Note: Algorithm 4 (AsyncUpdate) is separate and not called here by default.
+}
+
+// Test function for the full dynamic SSSP workflow using OpenMP algorithms
+void TestDynamicSSSPWorkflow_OpenMP(
+    Graph& G,
+    SSSPResult& T,
+    const std::vector<EdgeChange>& changes
+) {
+    int n = G.num_vertices;
+    std::vector<std::atomic<bool>> Affected(n);
+    #pragma omp parallel for
+    for (int i = 0; i < n; ++i) Affected[i] = false;
+
+    // 1. Identify and invalidate affected vertices (improved Algorithm 2)
+    IdentifyAndInvalidateAffected_OpenMP(G, T, changes, Affected);
+
+    // 2. Update affected vertices (Algorithm 3)
+    UpdateAffectedVertices_OpenMP(G, T, Affected);
+
+    // 3. Optionally, run asynchronous update (Algorithm 4)
+    AsyncUpdate_OpenMP(G, T, Affected);
+
+    // 4. Print updated SSSP result
+    std::cout << "--- After Dynamic SSSP Update (OpenMP) ---" << std::endl;
+    for (int v = 0; v < n; ++v) {
+        std::cout << "Vertex " << v << ": Dist = " << T.dist[v] << ", Parent = " << T.parent[v] << std::endl;
+    }
 }

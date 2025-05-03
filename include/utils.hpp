@@ -13,4 +13,6 @@
 Graph load_graph(const std::string& filename);
 std::vector<EdgeChange> load_edge_changes(const std::string& filename);
 
+#define INF std::numeric_limits<double>::max()
+
 #endif //PARALLEL_SSSP_UTILS_H

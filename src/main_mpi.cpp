@@ -10,11 +10,66 @@
 
 #include "../include/graph.h"
 #include "../include/utils.hpp"
+#include "sssp_sequential.cpp" // For process_batch_sequential
 
 // Forward declaration for the MPI SSSP function
 void SSSP_MPI(const Graph& graph, int source, SSSPResult& result, int argc, char* argv[]);
 // Forward declaration for sequential Dijkstra (needed for baseline/initial compute on rank 0)
 SSSPResult dijkstra(const Graph& g, int source);
+// Forward declaration for distributed Bellman-Ford SSSP
+void Distributed_BellmanFord_MPI(
+    Graph& local_graph,
+    const std::vector<int>& local_to_global,
+    const std::vector<int>& global_to_local,
+    const std::vector<idx_t>& part,
+    int my_rank,
+    int num_ranks,
+    int global_source,
+    std::vector<double>& global_dist
+);
+// Forward declaration for distributed dynamic SSSP update
+void Distributed_DynamicSSSP_MPI(
+    Graph& local_graph,
+    const std::vector<int>& local_to_global,
+    const std::vector<int>& global_to_local,
+    std::vector<double>& dist,
+    std::vector<int>& parent,
+    const std::vector<EdgeChange>& changes,
+    int my_rank,
+    int num_ranks,
+    const std::vector<idx_t>& part,
+    int source
+);
+
+// Helper: Extract local subgraph for this rank from the global graph and partition vector
+Graph extract_local_subgraph(const Graph& global_graph, const std::vector<idx_t>& part, int my_rank) {
+    int n = global_graph.num_vertices;
+    std::vector<int> local_vertices;
+    for (int v = 0; v < n; ++v) {
+        if (part[v] == my_rank) local_vertices.push_back(v);
+    }
+    // Map global vertex id to local id
+    std::vector<int> global_to_local(n, -1);
+    for (size_t i = 0; i < local_vertices.size(); ++i) {
+        global_to_local[local_vertices[i]] = i;
+    }
+    Graph local_graph(local_vertices.size());
+    // Add edges where both endpoints are local
+    for (size_t i = 0; i < local_vertices.size(); ++i) {
+        int u_global = local_vertices[i];
+        for (const auto& edge : global_graph.neighbors(u_global)) {
+            int v_global = edge.to;
+            if (part[v_global] == my_rank) {
+                int u_local = i;
+                int v_local = global_to_local[v_global];
+                if (v_local != -1) {
+                    local_graph.add_edge(u_local, v_local, edge.weight);
+                }
+            }
+        }
+    }
+    return local_graph;
+}
 
 int main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
@@ -110,10 +165,33 @@ int main(int argc, char* argv[]) {
                                                     &objval, part.data());
                 if (metis_ret != METIS_OK) {
                     std::cerr << "METIS partitioning failed (Rank 0). Error code: " << metis_ret << ". Aborting." << std::endl;
-                    // Fallback might be complex in MPI, aborting for now.
                     MPI_Abort(MPI_COMM_WORLD, 1);
                 } else {
                     std::cout << "METIS partitioning successful (Rank 0). Edge cut: " << objval << std::endl;
+                    // Print partition assignments for debugging
+                    std::cout << "METIS partition assignments:" << std::endl;
+                    for (size_t i = 0; i < part.size(); ++i) {
+                        std::cout << "Vertex " << i << " -> Partition " << part[i] << std::endl;
+                    }
+                    // Print number of vertices per partition
+                    std::vector<int> partition_counts(nParts, 0);
+                    for (size_t i = 0; i < part.size(); ++i) {
+                        partition_counts[part[i]]++;
+                    }
+                    std::cout << "Vertices per partition:" << std::endl;
+                    for (idx_t p = 0; p < nParts; ++p) {
+                        std::cout << "Partition " << p << ": " << partition_counts[p] << " vertices" << std::endl;
+                    }
+                    // Print all cross-partition edges
+                    std::cout << "Cross-partition edges:" << std::endl;
+                    for (int u = 0; u < graph.num_vertices; ++u) {
+                        for (const auto& edge : graph.neighbors(u)) {
+                            int v = edge.to;
+                            if (part[u] != part[v]) {
+                                std::cout << "Edge (" << u << "," << v << ") crosses partitions " << part[u] << " and " << part[v] << std::endl;
+                            }
+                        }
+                    }
                 }
             } else {
                  std::cerr << "Warning (Rank 0): Graph has no edges. Assigning vertices sequentially." << std::endl;
@@ -128,6 +206,45 @@ int main(int argc, char* argv[]) {
     // Use MPI_INT64_T assuming idx_t is 64-bit. Use MPI_INT if idx_t is 32-bit.
     MPI_Bcast(part.data(), graph.num_vertices, MPI_INT64_T, 0, MPI_COMM_WORLD); 
 
+    // --- Build local subgraph for each rank ---
+    Graph local_graph = extract_local_subgraph(graph, part, rank);
+    if (rank == 0) {
+        std::cout << "Partitioning and local subgraph extraction complete. Local vertices on rank 0: " << local_graph.num_vertices << std::endl;
+    }
+
+    // --- Build local_to_global and global_to_local mappings ---
+    std::vector<int> local_to_global;
+    std::vector<int> global_to_local(graph.num_vertices, -1);
+    for (int v = 0, local_idx = 0; v < graph.num_vertices; ++v) {
+        if (part[v] == rank) {
+            local_to_global.push_back(v);
+            global_to_local[v] = local_idx++;
+        }
+    }
+
+    // --- Distributed Bellman-Ford SSSP ---
+    std::vector<double> global_dist; // Only filled on rank 0
+    Distributed_BellmanFord_MPI(
+        local_graph,
+        local_to_global,
+        global_to_local,
+        part,
+        rank,
+        size,
+        start_node,
+        global_dist
+    );
+
+    if (rank == 0) {
+        std::cout << "\n--- Distributed Bellman-Ford SSSP Result (Distances from source " << start_node << ") ---" << std::endl;
+        for (size_t i = 0; i < global_dist.size(); ++i) {
+            std::cout << "Vertex " << i << ": Dist = ";
+            if (global_dist[i] == INFINITY_WEIGHT) std::cout << "INF";
+            else std::cout << global_dist[i];
+            std::cout << std::endl;
+        }
+    }
+
     // --- SSSP Calculation ---
     SSSPResult sssp_result(graph.num_vertices);
     if (rank == 0) {
@@ -141,22 +258,106 @@ int main(int argc, char* argv[]) {
     auto end_time_mpi = MPI_Wtime();
     double mpi_sssp_time_ms = (end_time_mpi - start_time_mpi) * 1000.0;
 
+    // --- Load and broadcast edge changes (if any) ---
+    std::vector<EdgeChange> changes;
+    if (rank == 0) {
+        // Try to load changes file if provided
+        if (argc > 4) {
+            std::string changes_file = argv[4];
+            std::cout << "\nLoading changes from " << changes_file << "..." << std::endl;
+            changes = load_edge_changes(changes_file);
+            std::cout << "Changes loaded: " << changes.size() << " total." << std::endl;
+        }
+    }
+    // Broadcast number of changes
+    int num_changes = changes.size();
+    MPI_Bcast(&num_changes, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (rank != 0) changes.resize(num_changes);
+    // Broadcast changes data
+    if (num_changes > 0) {
+        MPI_Bcast(changes.data(), num_changes * sizeof(EdgeChange), MPI_BYTE, 0, MPI_COMM_WORLD);
+    }
+
+    // --- Distributed Dynamic SSSP Update (if changes exist) ---
+    std::vector<double> dist(local_graph.num_vertices, INFINITY_WEIGHT);
+    std::vector<int> parent(local_graph.num_vertices, -1);
+    // Set local source if owned
+    if (global_to_local[start_node] != -1) {
+        dist[global_to_local[start_node]] = 0.0;
+    }
+    if (num_changes > 0) {
+        if (size == 1) {
+            // Single rank: use the same logic as the serial/OpenMP version
+            SSSPResult sssp_result(graph.num_vertices);
+            sssp_result.dist[start_node] = 0.0;
+            for (int i = 0; i < graph.num_vertices; ++i) sssp_result.parent[i] = -1;
+            process_batch_sequential(graph, sssp_result, changes);
+            // Copy results to dist/parent for output
+            for (int i = 0; i < graph.num_vertices; ++i) {
+                dist[i] = sssp_result.dist[i];
+                parent[i] = sssp_result.parent[i];
+            }
+        } else {
+            Distributed_DynamicSSSP_MPI(
+                local_graph,
+                local_to_global,
+                global_to_local,
+                dist,
+                parent,
+                changes,
+                rank,
+                size,
+                part,
+                start_node // Pass source argument
+            );
+        }
+    } else {
+        // If no changes, just run distributed Bellman-Ford
+        Distributed_BellmanFord_MPI(
+            local_graph,
+            local_to_global,
+            global_to_local,
+            part,
+            rank,
+            size,
+            start_node,
+            dist
+        );
+    }
+
+    // --- Gather and print results (distances and parents) on rank 0 ---
+    int n_global = part.size();
+    std::vector<int> global_parent(n_global, -1);
+    // Gather distances
+    std::vector<double> local_dist_out(n_global, INFINITY_WEIGHT);
+    for (int u_local = 0; u_local < (int)local_to_global.size(); ++u_local) {
+        int u_global = local_to_global[u_local];
+        local_dist_out[u_global] = dist[u_local];
+    }
+    MPI_Reduce(local_dist_out.data(), global_dist.data(), n_global, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    // Gather parents
+    std::vector<int> local_parent_out(n_global, -1);
+    for (int u_local = 0; u_local < (int)local_to_global.size(); ++u_local) {
+        int u_global = local_to_global[u_local];
+        local_parent_out[u_global] = parent[u_local];
+    }
+    MPI_Reduce(local_parent_out.data(), global_parent.data(), n_global, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        std::cout << "\n--- After Update/Recompute (MPI) ---" << std::endl;
+        std::cout << "Current SSSP Result:" << std::endl;
+        for (int i = 0; i < n_global; ++i) {
+            std::cout << "Vertex " << i << ": Dist = ";
+            if (global_dist[i] == INFINITY_WEIGHT) std::cout << "INF";
+            else std::cout << global_dist[i];
+            std::cout << ", Parent = " << global_parent[i] << std::endl;
+        }
+    }
+
     // --- Output Results (Rank 0) ---
     if (rank == 0) {
         std::cout << "\n--- Timings (MPI) ---" << std::endl;
         std::cout << "MPI SSSP Calculation: " << mpi_sssp_time_ms << " ms" << std::endl;
-
-        // Optional: Verify results or save Dist/Parent arrays
-        // Example: Print distance to a specific node
-        // int target_node = std::min(10, graph.num_vertices - 1);
-        // if (target_node >= 0 && target_node < graph.num_vertices) {
-        //     std::cout << "\nFinal distance (Rank 0) to node " << target_node << ": ";
-        //     if (sssp_result.dist[target_node] == INFINITY_WEIGHT) {
-        //         std::cout << "INF" << std::endl;
-        //     } else {
-        //         std::cout << sssp_result.dist[target_node] << std::endl;
-        //     }
-        // }
         std::cout << "\nExecution finished." << std::endl;
     }
 

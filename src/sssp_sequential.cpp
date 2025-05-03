@@ -10,6 +10,9 @@
 #include <iostream>
 #include <stdexcept> // For std::runtime_error
 
+// Constants
+#define INF std::numeric_limits<double>::max()
+
 // Baseline Dijkstra Algorithm
 SSSPResult dijkstra(const Graph& g, int source) {
     SSSPResult result(g.num_vertices);
@@ -42,6 +45,37 @@ SSSPResult dijkstra(const Graph& g, int source) {
     }
 
     return result;
+}
+
+void dijkstra(const Graph& graph, int start_node, SSSPResult& result) {
+    int num_vertices = graph.num_vertices;
+    result.dist.assign(num_vertices, INF);
+    result.parent.assign(num_vertices, -1);
+    result.dist[start_node] = 0;
+
+    std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>, std::greater<std::pair<int, int>>> pq;
+    pq.push({0, start_node});
+
+    while (!pq.empty()) {
+        int d = pq.top().first;
+        int u = pq.top().second;
+        pq.pop();
+
+        if (d > result.dist[u]) {
+            continue;
+        }
+
+        for (const auto& edge : graph.adj[u]) {
+            int v = edge.to;
+            int weight = edge.weight;
+
+            if (result.dist[v] > result.dist[u] + weight) {
+                result.dist[v] = result.dist[u] + weight;
+                result.parent[v] = u;
+                pq.push({result.dist[v], v});
+            }
+        }
+    }
 }
 
 // Helper function for SingleChange (part of Algorithm 1)
@@ -273,3 +307,4 @@ void process_batch_sequential(Graph& g, SSSPResult& sssp_result, const std::vect
     std::chrono::duration<double, std::milli> batch_time = end_batch - start_batch;
      std::cout << "Sequential batch processing finished in " << batch_time.count() << " ms." << std::endl;
 }
+

@@ -38,26 +38,7 @@ struct Graph {
     }
 
     // Placeholder for removing an edge - requires finding the edge first
-    void remove_edge(int u, int v) {
-         if (u < 0 || u >= num_vertices || v < 0 || v >= num_vertices) {
-             throw std::out_of_range("Vertex index out of range in remove_edge");
-        }
-        auto remove = [&](int from, int to) {
-            // Use reference to modify the vector directly
-            auto& neighbors = adj[from];
-            for (auto it = neighbors.begin(); it != neighbors.end(); ++it) {
-                if (it->to == to) {
-                    // Use iterator arithmetic for erase
-                    neighbors.erase(it);
-                    return true; // Indicate edge was found and removed
-                }
-            }
-            return false; // Indicate edge was not found
-        };
-        // Attempt removal in both directions, ignore if edge doesn't exist
-        remove(u, v);
-        remove(v, u);
-    }
+    void remove_edge(int u, int v);
 
     // Add const overload for neighbors
     const std::vector<Edge>& neighbors(int u) const {
@@ -93,6 +74,9 @@ struct Graph {
         }
         return count;
     }
+
+    // Check if an edge exists between two vertices
+    bool has_edge(int u, int v) const;
 };
 
 // Structure to hold SSSP results

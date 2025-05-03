@@ -25,10 +25,20 @@ void process_batch_sequential(Graph& g, SSSPResult& sssp_result, const std::vect
 // OpenMP - Corrected Forward Declaration
 // Matches the expected signature used later and likely defined in sssp_parallel_openmp.cpp
 void BatchUpdate_OpenMP(const Graph& G, SSSPResult& T, const std::vector<EdgeChange>& changes);
+void TestDynamicSSSPWorkflow_OpenMP(Graph& G, SSSPResult& T, const std::vector<EdgeChange>& changes);
 
 // OpenCL (Placeholder)
 // void BatchUpdate_OpenCL(const Graph& G, SSSPResult& T, const std::vector<EdgeChange>& changes);
 
+
+// Function to print the current state of distances and parents
+void print_sssp_result(const SSSPResult& sssp_result) {
+    std::cout << "Current SSSP Result:" << std::endl;
+    for (size_t i = 0; i < sssp_result.dist.size(); ++i) {
+        std::cout << "Vertex " << i << ": Dist = " << sssp_result.dist[i]
+                  << ", Parent = " << sssp_result.parent[i] << std::endl;
+    }
+}
 
 int main(int argc, char* argv[]) {
     // Updated usage message to include mode
@@ -162,6 +172,10 @@ int main(int argc, char* argv[]) {
              has_changes = false;
         }
 
+        // Print all loaded changes for debugging
+        for (const auto& change : changes) {
+            std::cout << (change.is_insertion ? "Insert" : "Delete") << " edge: (" << change.u << ", " << change.v << ")" << std::endl;
+        }
 
         // Apply changes if loaded
         if (has_changes) {
@@ -175,8 +189,6 @@ int main(int argc, char* argv[]) {
                  try {
                      // Validate indices before applying change
                      if (change.u < 0 || change.u >= graph.num_vertices || change.v < 0 || change.v >= graph.num_vertices) {
-                         // std::cerr << "Warning: Skipping change involving out-of-bounds vertex: "
-                         //           << (change.is_insertion ? "insert " : "delete ") << change.u << " " << change.v << std::endl;
                          skipped_changes++;
                          continue;
                      }
@@ -184,6 +196,7 @@ int main(int argc, char* argv[]) {
                      if (change.is_insertion) {
                          graph.add_edge(change.u, change.v, change.weight);
                      } else {
+                         std::cout << "Calling remove_edge for (" << change.u << ", " << change.v << ")" << std::endl;
                          graph.remove_edge(change.u, change.v); // remove_edge should handle non-existent edges gracefully
                      }
                  } catch (const std::exception& e) { // Catch potential errors during modification
@@ -200,6 +213,12 @@ int main(int argc, char* argv[]) {
                  std::cout << " (" << skipped_changes << " changes skipped due to errors or invalid indices)";
              }
              std::cout << std::endl;
+
+             std::cout << "\n--- After Applying Changes ---" << std::endl;
+             print_sssp_result(sssp_result);
+
+             // Debug: Verify edge removal
+             std::cout << "Edge (0, 1) removed: " << !graph.has_edge(0, 1) << std::endl;
 
         } else if (mode != "baseline") {
              std::cout << "\nMode '" << mode << "' requires a changes file, but none was provided or loaded. Only initial SSSP was computed." << std::endl;
@@ -236,9 +255,8 @@ int main(int argc, char* argv[]) {
             }
         } else if (mode == "openmp") {
              if (has_changes) {
-                std::cout << "Processing batch using OpenMP..." << std::endl;
-                // Corrected call to BatchUpdate_OpenMP
-                BatchUpdate_OpenMP(graph, sssp_result, changes); // Pass graph, result struct, and changes vector
+                std::cout << "Processing batch using OpenMP (dynamic workflow)..." << std::endl;
+                TestDynamicSSSPWorkflow_OpenMP(graph, sssp_result, changes);
                 update_performed = true;
              } else {
                  std::cout << "OpenMP mode selected, but no changes file provided. Skipping update." << std::endl;
@@ -266,6 +284,15 @@ int main(int argc, char* argv[]) {
         auto end_time_update = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double, std::milli> update_time = end_time_update - start_time_update;
 
+        if (update_performed) {
+            std::cout << "\n--- After Update/Recompute (" << mode << ") ---" << std::endl;
+            print_sssp_result(sssp_result);
+
+            // Debug: Check if Parent[1] is still 0
+            if (sssp_result.parent[1] == 0) {
+                std::cerr << "Error: Parent of Vertex 1 is still 0 after edge (0, 1) deletion!" << std::endl;
+            }
+        }
 
         // --- Output Results ---
         std::cout << "\n--- Timings ---" << std::endl;
@@ -319,3 +346,4 @@ int main(int argc, char* argv[]) {
 
 // Ensure load_graph and load_edge_changes are correctly linked from utils or defined if utils is header-only.
 // If utils.hpp contains implementations, no separate linking needed. If it's split into .hpp/.cpp, ensure CMake links it.
+

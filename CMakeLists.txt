@@ -57,6 +57,7 @@ add_executable(Parallel_SSSP
         src/sssp_sequential.cpp
         src/sssp_parallel_openmp.cpp
         src/utils.cpp
+        src/graph.cpp # Ensure this line is present
 )
 
 # Add executable for the update generator program
@@ -70,8 +71,16 @@ add_executable(Parallel_SSSP_MPI
         src/main_mpi.cpp
         src/sssp_parallel_mpi.cpp
         src/utils.cpp
+        src/graph.cpp
 )
 
+# Add executable for the Serial version
+add_executable(Parallel_SSSP_SERIAL
+        src/main_serial.cpp
+        src/sssp_sequential.cpp
+        src/utils.cpp
+        src/graph.cpp
+)
 # Link OpenMP to the main program
 target_link_libraries(Parallel_SSSP PRIVATE OpenMP::OpenMP_CXX)
 
