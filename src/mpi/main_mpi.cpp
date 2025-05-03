@@ -77,39 +77,57 @@ int mpi_main(int argc, char* argv[]) {
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     // --- Argument Parsing (Rank 0 handles and broadcasts) ---
+    // Expected arguments after shift from main:
+    // argv[0]: graph_file
+    // argv[1]: start_node
+    // argv[2]: changes_file (optional)
+    // argv[3]: num_partitions (optional, defaults to number of ranks)
     std::string filename;
     int start_node = -1;
-    idx_t num_partitions = 1; // Default partitions
-    // Add other parameters as needed
+    std::string changes_filename = ""; // Initialize changes filename
+    idx_t num_partitions = size; // Default partitions to number of MPI ranks
 
     if (rank == 0) {
-        if (argc < 3) {
-            std::cerr << "Usage: mpirun -np <num_procs> " << argv[0] << " <graph_file.ext> <start_node> [num_partitions]" << std::endl;
-            std::cerr << "Note: .ext can be .mtx or .edges" << std::endl;
+        if (argc < 2) { // Need at least graph_file and start_node
+            std::cerr << "Usage (from main): <graph_file.ext> <start_node> [changes_file] [num_partitions]" << std::endl;
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        filename = argv[1];
+        filename = argv[0];
         try {
-            start_node = std::stoi(argv[2]);
+            start_node = std::stoi(argv[1]);
         } catch (const std::exception& e) {
-            std::cerr << "Error: Invalid start node provided: " << argv[2] << std::endl;
+            std::cerr << "Error: Invalid start node provided: " << argv[1] << std::endl;
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        if (argc > 3) {
-             try {
-                num_partitions = std::max(1, std::stoi(argv[3]));
-             } catch (const std::exception& e) {
-                 std::cerr << "Warning: Invalid number of partitions provided: " << argv[3] << ". Using default (1)." << std::endl;
-                 num_partitions = 1;
-             }
+        if (argc > 2) {
+            changes_filename = argv[2]; // Optional changes file
         }
-        // Broadcast necessary parameters (filename length, filename, start_node, num_partitions)
+        if (argc > 3) { // Optional num_partitions
+             try {
+                // Ensure at least 1 partition, default was already 'size'
+                num_partitions = std::max((idx_t)1, (idx_t)std::stoi(argv[3]));
+             } catch (const std::exception& e) {
+                 std::cerr << "Warning: Invalid number of partitions provided: '" << argv[3] << "'. Using default (" << size << "). Error: " << e.what() << std::endl;
+                 num_partitions = size; // Use default (number of ranks)
+             }
+        } else {
+             std::cout << "Number of partitions not specified. Defaulting to number of MPI ranks (" << size << ")." << std::endl;
+             num_partitions = size; // Explicitly set default if not provided
+        }
+
+        // Broadcast necessary parameters
         int fn_len = filename.length();
         MPI_Bcast(&fn_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(const_cast<char*>(filename.c_str()), fn_len + 1, MPI_CHAR, 0, MPI_COMM_WORLD); // +1 for null terminator
+        MPI_Bcast(const_cast<char*>(filename.c_str()), fn_len + 1, MPI_CHAR, 0, MPI_COMM_WORLD);
+
+        int cfn_len = changes_filename.length(); // Length of changes filename
+        MPI_Bcast(&cfn_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (cfn_len > 0) { // Only broadcast if changes_filename is not empty
+             MPI_Bcast(const_cast<char*>(changes_filename.c_str()), cfn_len + 1, MPI_CHAR, 0, MPI_COMM_WORLD);
+        }
+
         MPI_Bcast(&start_node, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        // Use MPI_INT64_T assuming idx_t is 64-bit. Use MPI_INT if idx_t is 32-bit.
-        MPI_Bcast(&num_partitions, 1, MPI_INT64_T, 0, MPI_COMM_WORLD); 
+        MPI_Bcast(&num_partitions, 1, MPI_INT64_T, 0, MPI_COMM_WORLD); // Assuming idx_t is 64-bit
 
     } else {
         // Receive parameters on non-root ranks
@@ -118,13 +136,22 @@ int mpi_main(int argc, char* argv[]) {
         std::vector<char> fn_buffer(fn_len + 1);
         MPI_Bcast(fn_buffer.data(), fn_len + 1, MPI_CHAR, 0, MPI_COMM_WORLD);
         filename = std::string(fn_buffer.data());
+
+        int cfn_len;
+        MPI_Bcast(&cfn_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (cfn_len > 0) {
+            std::vector<char> cfn_buffer(cfn_len + 1);
+            MPI_Bcast(cfn_buffer.data(), cfn_len + 1, MPI_CHAR, 0, MPI_COMM_WORLD);
+            changes_filename = std::string(cfn_buffer.data());
+        } else {
+            changes_filename = ""; // Ensure it's empty if length was 0
+        }
+
         MPI_Bcast(&start_node, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        // Use MPI_INT64_T assuming idx_t is 64-bit. Use MPI_INT if idx_t is 32-bit.
-        MPI_Bcast(&num_partitions, 1, MPI_INT64_T, 0, MPI_COMM_WORLD); 
+        MPI_Bcast(&num_partitions, 1, MPI_INT64_T, 0, MPI_COMM_WORLD); // Assuming idx_t is 64-bit
     }
 
-    // --- Graph Loading (All ranks load the full graph for now) ---
-    // Optimization: Could have rank 0 load and broadcast, or use parallel I/O.
+    // --- Graph Loading (All ranks load the full graph) ---
     Graph graph(0);
     try {
         if (rank == 0) std::cout << "Rank " << rank << " loading graph from " << filename << "..." << std::endl;
@@ -221,6 +248,38 @@ int mpi_main(int argc, char* argv[]) {
         }
     }
 
+    // --- Load and broadcast edge changes (if filename provided) ---
+    std::vector<EdgeChange> changes;
+    int num_changes = 0; // Initialize num_changes
+    if (rank == 0) {
+        if (!changes_filename.empty()) { // Check if changes filename was provided
+            std::cout << "\nLoading changes from " << changes_filename << "..." << std::endl;
+            try {
+                changes = load_edge_changes(changes_filename);
+                std::cout << "Changes loaded: " << changes.size() << " total." << std::endl;
+                num_changes = changes.size(); // Set num_changes based on loaded vector
+            } catch (const std::exception& e) {
+                 std::cerr << "Warning: Failed to load changes file '" << changes_filename << "'. Error: " << e.what() << std::endl;
+                 num_changes = 0; // Ensure num_changes is 0 if loading fails
+                 changes.clear();
+            }
+        } else {
+             std::cout << "\nNo changes file provided." << std::endl;
+             num_changes = 0; // Ensure num_changes is 0 if no file provided
+        }
+    }
+    // Broadcast number of changes
+    MPI_Bcast(&num_changes, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Resize and broadcast changes data only if num_changes > 0
+    if (num_changes > 0) {
+        if (rank != 0) changes.resize(num_changes);
+        MPI_Bcast(changes.data(), num_changes * sizeof(EdgeChange), MPI_BYTE, 0, MPI_COMM_WORLD);
+    } else {
+        // Ensure changes vector is empty on all ranks if num_changes is 0
+        changes.clear();
+    }
+
     // --- Distributed Bellman-Ford SSSP ---
     std::vector<double> global_dist; // Only filled on rank 0
     Distributed_BellmanFord_MPI(
@@ -257,75 +316,67 @@ int mpi_main(int argc, char* argv[]) {
     auto end_time_mpi = MPI_Wtime();
     double mpi_sssp_time_ms = (end_time_mpi - start_time_mpi) * 1000.0;
 
-    // --- Load and broadcast edge changes (if any) ---
-    std::vector<EdgeChange> changes;
-    if (rank == 0) {
-        // Try to load changes file if provided
-        if (argc > 4) {
-            std::string changes_file = argv[4];
-            std::cout << "\nLoading changes from " << changes_file << "..." << std::endl;
-            changes = load_edge_changes(changes_file);
-            std::cout << "Changes loaded: " << changes.size() << " total." << std::endl;
-        }
-    }
-    // Broadcast number of changes
-    int num_changes = changes.size();
-    MPI_Bcast(&num_changes, 1, MPI_INT, 0, MPI_COMM_WORLD);
-    if (rank != 0) changes.resize(num_changes);
-    // Broadcast changes data
-    if (num_changes > 0) {
-        MPI_Bcast(changes.data(), num_changes * sizeof(EdgeChange), MPI_BYTE, 0, MPI_COMM_WORLD);
-    }
-
-    // --- Distributed Dynamic SSSP Update (if changes exist) ---
+    // --- Distributed Dynamic SSSP Update or Initial Bellman-Ford ---
     std::vector<double> dist(local_graph.num_vertices, INFINITY_WEIGHT);
     std::vector<int> parent(local_graph.num_vertices, -1);
-    // Set local source if owned
-    if (global_to_local[start_node] != -1) {
-        dist[global_to_local[start_node]] = 0.0;
+    // Set local source distance if owned
+    int local_source_idx = global_to_local[start_node];
+    if (local_source_idx != -1) {
+        dist[local_source_idx] = 0.0;
     }
+
+    auto start_time_update = MPI_Wtime(); // Timer for update/initial compute
+
     if (num_changes > 0) {
-        if (size == 1) {
-            // Single rank: use the same logic as the serial/OpenMP version
-            SSSPResult sssp_result(graph.num_vertices);
-            sssp_result.dist[start_node] = 0.0;
-            for (int i = 0; i < graph.num_vertices; ++i) sssp_result.parent[i] = -1;
-            // process_batch_sequential(graph, sssp_result, changes);
-            // Copy results to dist/parent for output
-            for (int i = 0; i < graph.num_vertices; ++i) {
-                dist[i] = sssp_result.dist[i];
-                parent[i] = sssp_result.parent[i];
-            }
-        } else {
-            Distributed_DynamicSSSP_MPI(
-                local_graph,
-                local_to_global,
-                global_to_local,
-                dist,
-                parent,
-                changes,
-                rank,
-                size,
-                part,
-                start_node // Pass source argument
-            );
-        }
-    } else {
-        // If no changes, just run distributed Bellman-Ford
-        Distributed_BellmanFord_MPI(
+        if (rank == 0) std::cout << "Processing " << num_changes << " changes using Distributed Dynamic SSSP..." << std::endl;
+        // Call the dynamic update function
+        Distributed_DynamicSSSP_MPI(
             local_graph,
             local_to_global,
             global_to_local,
-            part,
+            dist,
+            parent,
+            changes,
             rank,
             size,
-            start_node,
-            dist
+            part,
+            start_node
         );
+    } else {
+        if (rank == 0) std::cout << "No changes detected. Running initial Distributed Bellman-Ford..." << std::endl;
+        // Run initial Bellman-Ford if no changes
+        // Note: Bellman-Ford implementation needs to populate 'dist' correctly.
+        // The current Distributed_BellmanFord_MPI signature returns results in 'global_dist' on rank 0 only.
+        // We need a version that populates the local 'dist' vector on each rank.
+        // For now, let's assume Distributed_DynamicSSSP_MPI handles the initial case if changes is empty,
+        // or we need to adjust the Bellman-Ford call.
+        // --- TEMPORARY: Assuming Dynamic handles initial if changes empty ---
+         Distributed_DynamicSSSP_MPI(
+            local_graph,
+            local_to_global,
+            global_to_local,
+            dist, // Pass local dist vector
+            parent, // Pass local parent vector
+            changes, // Pass empty changes vector
+            rank,
+            size,
+            part,
+            start_node
+        );
+        // --- END TEMPORARY ---
+        // TODO: Replace above with a proper call to a distributed Bellman-Ford
+        //       that populates the local 'dist' and 'parent' vectors, or ensure
+        //       Distributed_DynamicSSSP_MPI handles the empty changes case correctly
+        //       as an initial computation.
     }
+    auto end_time_update = MPI_Wtime();
+    double update_time_ms = (end_time_update - start_time_update) * 1000.0;
 
     // --- Gather and print results (distances and parents) on rank 0 ---
     int n_global = part.size();
+    if (rank == 0) {
+        global_dist.assign(n_global, INFINITY_WEIGHT); // Resize and initialize on rank 0
+    }
     std::vector<int> global_parent(n_global, -1);
     // Gather distances
     std::vector<double> local_dist_out(n_global, INFINITY_WEIGHT);
@@ -333,16 +384,44 @@ int mpi_main(int argc, char* argv[]) {
         int u_global = local_to_global[u_local];
         local_dist_out[u_global] = dist[u_local];
     }
-    MPI_Reduce(local_dist_out.data(), global_dist.data(), n_global, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-    // Gather parents
+    // MPI_Reduce needs a valid buffer on rank 0, even if it's overwritten.
+    // Other ranks pass their local_dist_out. Rank 0 passes its local_dist_out as well.
+    MPI_Reduce(rank == 0 ? MPI_IN_PLACE : local_dist_out.data(), // Source buffer (MPI_IN_PLACE for root)
+               rank == 0 ? global_dist.data() : nullptr,         // Receive buffer (only root receives)
+               n_global, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+
+    // Gather parents (Need careful reduction for parents, MAX might not be correct)
+    // For simplicity, let's gather all parent arrays to rank 0
     std::vector<int> local_parent_out(n_global, -1);
-    for (int u_local = 0; u_local < (int)local_to_global.size(); ++u_local) {
+     for (int u_local = 0; u_local < (int)local_to_global.size(); ++u_local) {
         int u_global = local_to_global[u_local];
-        local_parent_out[u_global] = parent[u_local];
+        // Map local parent index back to global index if not -1
+        // Ensure parent[u_local] is within the bounds of local_to_global
+        if (parent[u_local] != -1 && parent[u_local] >= 0 && parent[u_local] < local_to_global.size()) { 
+             local_parent_out[u_global] = local_to_global[parent[u_local]];
+        } else {
+             local_parent_out[u_global] = -1; // Keep as -1 if no parent or invalid index
+        }
     }
-    MPI_Reduce(local_parent_out.data(), global_parent.data(), n_global, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
+    // Use MPI_Gather on rank 0 to collect all local_parent_out arrays
+    std::vector<int> gathered_parents;
+    if (rank == 0) gathered_parents.resize(n_global * size);
+    MPI_Gather(local_parent_out.data(), n_global, MPI_INT,
+               gathered_parents.data(), n_global, MPI_INT, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
+        // Combine gathered parent arrays: take the first non -1 value found for each vertex
+        for(int i=0; i<n_global; ++i) {
+            global_parent[i] = -1; // Initialize
+            for(int r=0; r<size; ++r) {
+                int val = gathered_parents[r * n_global + i];
+                if (val != -1) {
+                    global_parent[i] = val;
+                    break; // Found a parent, move to next global vertex
+                }
+            }
+        }
+
         std::cout << "\n--- After Update/Recompute (MPI) ---" << std::endl;
         std::cout << "Current SSSP Result:" << std::endl;
         for (int i = 0; i < n_global; ++i) {
@@ -353,10 +432,11 @@ int mpi_main(int argc, char* argv[]) {
         }
     }
 
-    // --- Output Results (Rank 0) ---
+    // --- Output Timings (Rank 0) ---
     if (rank == 0) {
         std::cout << "\n--- Timings (MPI) ---" << std::endl;
-        std::cout << "MPI SSSP Calculation: " << mpi_sssp_time_ms << " ms" << std::endl;
+        // std::cout << "MPI SSSP Calculation: " << mpi_sssp_time_ms << " ms" << std::endl; // Old timer location
+        std::cout << "MPI Update/Compute Time: " << update_time_ms << " ms" << std::endl; // New timer location
         std::cout << "\nExecution finished." << std::endl;
     }
 

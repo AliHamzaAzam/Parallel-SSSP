@@ -56,17 +56,20 @@ int main(int argc, char* argv[]) {
         std::cerr << "First argument must be --mode" << std::endl;
         return 1;
     }
+    // Ensure there's a mode value AND at least one more argument for the sub-main
     if (argc < 4) {
-        std::cerr << "Error: --mode requires an argument (serial|openmp|mpi) and additional arguments." << std::endl;
+        std::cerr << "Error: --mode requires an argument (serial|openmp|mpi) and additional arguments for the selected mode." << std::endl;
         return 1;
     }
     std::string mode = argv[2];
 
-
     // Shift argv so that sub-mains see their expected arguments
-    argc -= 2;
-    argv += 2;
+    // Remove executable name, --mode flag, and the mode value itself
+    argc -= 3;
+    argv += 3;
 
+    // Now argv[0] should be the first argument intended for the sub-main
+    // e.g., graph_file for serial/openmp, or potentially different for mpi
 
     if (mode == "serial") return serial_main(argc, argv);
     if (mode == "openmp" || mode == "parallel") return parallel_main(argc, argv);
