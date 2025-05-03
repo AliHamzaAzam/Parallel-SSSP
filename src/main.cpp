@@ -79,47 +79,49 @@ int main(int argc, char* argv[]) {
 }
 
 int serial_main(int argc, char* argv[]) {
-    // Argument parsing: prog <graph> <start> [mode] [changes_file]
-    if (argc < 3) { // Need at least graph and start node
-        std::cerr << "Usage: " << argv[0] << " <graph_file> <start_node> [mode] [changes_file]" << std::endl;
-        std::cerr << "Modes: baseline, sequential (default: baseline)" << std::endl;
+    // After shift in main: argv[0]=graph, argv[1]=start, argv[2]=mode, argv[3]=changes
+    if (argc < 2) { // Need at least graph and start node
+        std::cerr << "Usage (serial mode): <graph_file> <start_node> [baseline|sequential] [changes_file]" << std::endl;
         return 1;
     }
 
-    std::string filename = argv[1];
+    std::string filename = argv[0]; // Correct index for graph file
     int start_node = -1;
     std::string mode = "baseline";
-    idx_t num_partitions = 1; // Re-introduce and initialize num_partitions
+    idx_t num_partitions = 1;
     std::string update_filename = "";
     bool has_changes = false;
 
     try {
-        start_node = std::stoi(argv[2]); // Parse start node
-        if (argc > 3) mode = argv[3];   // Parse mode if present
+        start_node = std::stoi(argv[1]); // Correct index for start node
+        if (argc > 2) mode = argv[2];   // Correct index for mode
 
         // Correctly parse changes_file based on position and mode
-        if (argc > 4) { // If there's an argument after the mode
-            if (mode == "sequential") {
-                update_filename = argv[4];
+        if (argc > 3) { // If there's an argument after the mode
+            if (mode == "sequential" || mode == "baseline") {
+                update_filename = argv[3]; // Correct index for changes file
                 has_changes = true;
-            } else if (mode == "baseline") {
-                // Allow changes file for baseline recomputation
-                update_filename = argv[4];
-                has_changes = true; // Mark that changes should be loaded/applied to graph before recompute
-                std::cout << "Warning: Changes file provided (" << update_filename << ") in 'baseline' mode. Changes will be applied for recomputation." << std::endl;
+                if (mode == "baseline") {
+                     std::cout << "Warning: Changes file provided (" << update_filename << ") in 'baseline' mode. Changes will be applied for recomputation." << std::endl;
+                }
             } else {
-                 std::cerr << "Warning: Unexpected argument '" << argv[4] << "' provided after mode '" << mode << "'. Ignoring." << std::endl;
-                 // If other serial modes were added, handle them here.
+                 std::cerr << "Warning: Unexpected argument '" << argv[3] << "' provided after mode '" << mode << "'. Ignoring." << std::endl;
             }
         }
 
         // Validate mode *after* parsing potential changes file
         if (mode != "baseline" && mode != "sequential") {
-             std::cerr << "Error: Invalid mode '" << mode << "' specified for serial execution." << std::endl;
+             std::cerr << "Error: Invalid mode '" << mode << "' specified for serial execution. Must be 'baseline' or 'sequential'." << std::endl;
              return 1;
         }
 
 
+    } catch (const std::invalid_argument& ia) {
+        std::cerr << "Error parsing start node: Invalid integer format '" << argv[1] << "'. " << ia.what() << std::endl;
+        return 1;
+    } catch (const std::out_of_range& oor) {
+        std::cerr << "Error parsing start node: Integer out of range '" << argv[1] << "'. " << oor.what() << std::endl;
+        return 1;
     } catch (const std::exception& e) {
         std::cerr << "Error parsing arguments: " << e.what() << std::endl;
         return 1;
@@ -246,12 +248,13 @@ int serial_main(int argc, char* argv[]) {
                      // Validate indices before applying change
                      if (change.u < 0 || change.u >= graph.num_vertices || change.v < 0 || change.v >= graph.num_vertices) {
                          std::cerr << "Warning: Skipping change due to out-of-bounds vertex index: "
-                                   << (change.is_insertion ? "i " : "d ") << change.u << " " << change.v << std::endl;
+                                   << (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE ? "i/d " : "d/i ")
+                                   << change.u << " " << change.v << std::endl;
                          skipped_changes++;
                          continue;
                      }
 
-                     if (change.is_insertion) {
+                     if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) {
                          graph.add_edge(change.u, change.v, change.weight);
                      } else {
                          // std::cout << "Calling remove_edge for (" << change.u << ", " << change.v << ")" << std::endl; // Debug
@@ -259,7 +262,7 @@ int serial_main(int argc, char* argv[]) {
                      }
                  } catch (const std::exception& e) { // Catch potential errors during modification
                       std::cerr << "Warning: Error applying change ("
-                                << (change.is_insertion ? "insert" : "delete") << " " << change.u << " " << change.v
+                                << (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE ? "insert/decrease" : "delete/increase") << " " << change.u << " " << change.v
                                 << "). Skipping change. Error: " << e.what() << std::endl;
                       skipped_changes++;
                  }

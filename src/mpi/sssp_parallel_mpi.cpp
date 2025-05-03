@@ -140,7 +140,7 @@ void Incremental_SSSP_MPI(Graph& graph, int source, SSSPResult& result, const st
 
     // Step 1: Apply updates to the graph (all processes do this)
     for (const auto& update : updates) {
-        if (update.is_insertion) {
+        if (update.type == ChangeType::INSERT || update.type == ChangeType::DECREASE) { // Insertion or weight decrease
             // Handle insertion
             graph.add_edge(update.u, update.v, update.weight);
         } else {
@@ -296,7 +296,7 @@ void Distributed_IdentifyAffected_MPI(
     // Step 1: Mark directly affected vertices locally
     std::vector<bool> affected_global(n_global, false);
     for (const auto& change : changes) {
-        if (!change.is_insertion) { // Deletion
+        if (change.type == ChangeType::DELETE || change.type == ChangeType::INCREASE) { // Deletion or weight increase
             int u = change.u, v = change.v;
             if (u >= 0 && u < n_global) affected_global[u] = true;
             if (v >= 0 && v < n_global) affected_global[v] = true;
@@ -453,7 +453,9 @@ void Distributed_DynamicSSSP_MPI(
     int my_rank,
     int num_ranks,
     const std::vector<idx_t>& part,
-    int source // <-- new argument
+    int source, // <-- new argument
+    const std::vector<bool>& initial_affected_del, // Added missing parameter
+    const std::vector<bool>& initial_affected      // Added missing parameter
 ) {
     int n_local = local_graph.num_vertices;
     // 1. Apply changes to local subgraph (insertions/deletions)
@@ -461,7 +463,7 @@ void Distributed_DynamicSSSP_MPI(
         int u = change.u, v = change.v;
         int u_local = (u < (int)global_to_local.size()) ? global_to_local[u] : -1;
         int v_local = (v < (int)global_to_local.size()) ? global_to_local[v] : -1;
-        if (change.is_insertion) {
+        if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) { // Insertion or weight decrease
             if (u_local != -1 && v_local != -1) {
                 local_graph.add_edge(u_local, v_local, change.weight);
             }
@@ -472,8 +474,13 @@ void Distributed_DynamicSSSP_MPI(
         }
     }
     // 2. Identify affected vertices (with descendant propagation)
-    std::vector<bool> affected(n_local, false);
-    // Gather global parent array for propagation
+    // Use initial_affected instead of recalculating from scratch
+    std::vector<bool> affected = initial_affected; // Initialize with provided status
+    // The propagation logic might need adjustment based on how initial_affected is calculated
+    // For now, assume initial_affected already includes direct effects.
+    // We might still need global propagation if initial_affected only covers rank 0's view.
+
+    // Gather global parent array for propagation (if needed)
     int n_global = part.size();
     std::vector<int> global_parent(n_global, -1);
     std::vector<int> local_parent_out(n_global, -1);
@@ -482,7 +489,9 @@ void Distributed_DynamicSSSP_MPI(
         local_parent_out[u_global] = parent[u_local];
     }
     MPI_Allreduce(local_parent_out.data(), global_parent.data(), n_global, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    Distributed_IdentifyAffected_MPI(local_graph, local_to_global, global_to_local, changes, affected, global_parent, my_rank, num_ranks, part);
+    // Distributed_IdentifyAffected_MPI(local_graph, local_to_global, global_to_local, changes, affected, global_parent, my_rank, num_ranks, part);
+    // ^^^ Consider if this is still needed or if initial_affected is sufficient ^^^ 
+
     // 3. Invalidate affected vertices and descendants
     for (int u_local = 0; u_local < n_local; ++u_local) {
         if (affected[u_local]) {

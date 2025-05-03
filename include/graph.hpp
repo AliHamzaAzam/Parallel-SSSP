@@ -68,14 +68,23 @@ struct SSSPResult {
     std::vector<Weight> dist; // Use Weight type alias
     std::vector<int> parent;
 
-    SSSPResult(int n) : dist(n, INFINITY_WEIGHT), parent(n, -1) {}
+    // Constructor initializing vectors
+    SSSPResult(int n = 0) : dist(n, INFINITY_WEIGHT), parent(n, -1) {}
+};
+
+// Enum for types of edge changes
+enum class ChangeType {
+    INSERT,
+    DELETE,
+    INCREASE, // Weight increase (treated like DELETE in some contexts)
+    DECREASE  // Weight decrease (treated like INSERT in some contexts)
 };
 
 // Structure for edge changes
 struct EdgeChange {
     int u, v;
     Weight weight; // Use Weight type alias
-    bool is_insertion;
+    ChangeType type; // Type of change
 };
 
 #endif //PARALLEL_SSSP_GRAPH_H

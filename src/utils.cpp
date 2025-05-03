@@ -209,12 +209,12 @@ std::vector<EdgeChange> load_edge_changes(const std::string& filename) {
         if (ss >> type >> u >> v) {
             if (type == 'i') {
                 if (ss >> weight) {
-                    changes.push_back({u, v, weight, true});
+                    changes.push_back({u, v, weight, ChangeType::INSERT});
                 } else {
                     std::cerr << "Warning: Skipping malformed insertion line (missing weight): " << line << std::endl;
                 }
             } else if (type == 'd') {
-                changes.push_back({u, v, 0.0, false}); // Weight ignored for deletion
+                changes.push_back({u, v, 0.0, ChangeType::DELETE}); // Weight ignored for deletion
             } else {
                  std::cerr << "Warning: Skipping malformed line (invalid type): " << line << std::endl;
             }

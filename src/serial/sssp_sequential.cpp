@@ -97,7 +97,7 @@ void SingleChange(const EdgeChange& change, Graph& G, SSSPResult& T) {
 
     // --- Apply the change to the graph structure ---
     try {
-        if (change.is_insertion) {
+        if (change.type == ChangeType::INSERT) {
             // If edge exists, update weight? Or assume new edge? Let's assume add_edge handles duplicates if needed.
             G.add_edge(u, v, weight);
         } else { // Deletion
@@ -129,7 +129,7 @@ void SingleChange(const EdgeChange& change, Graph& G, SSSPResult& T) {
     };
 
 
-    if (change.is_insertion) {
+    if (change.type == ChangeType::INSERT) {
         // Check if the new/updated edge offers a shorter path
         if (old_dist_u != INFINITY_WEIGHT && old_dist_u + weight < T.dist[v]) {
             T.dist[v] = old_dist_u + weight;
@@ -272,7 +272,7 @@ void process_batch_sequential(Graph& g, SSSPResult& sssp_result, const std::vect
         // Basic validation of change indices before calling SingleChange
         if (change.u < 0 || change.u >= g.num_vertices || change.v < 0 || change.v >= g.num_vertices) {
              std::cerr << "Warning: Skipping change in batch involving out-of-bounds vertex: "
-                       << (change.is_insertion ? "insert " : "delete ") << change.u << " " << change.v << std::endl;
+                       << (change.type == ChangeType::INSERT ? "insert " : "delete ") << change.u << " " << change.v << std::endl;
              continue;
         }
         SingleChange(change, g, sssp_result); // Modifies 'g' and 'sssp_result'

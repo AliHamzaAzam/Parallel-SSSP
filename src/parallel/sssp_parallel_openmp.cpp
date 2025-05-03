@@ -61,7 +61,7 @@ void ProcessChanges_OpenMP(
         }
 
 
-        if (change.is_insertion) {
+        if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) {
             Weight w = change.weight;
             // Determine closer (x) and farther (y) vertices based on current Dist
             int x, y;
@@ -174,7 +174,7 @@ void IdentifyAndInvalidateAffected_OpenMP(
     #pragma omp parallel for
     for (size_t i = 0; i < changes.size(); ++i) {
         const auto& change = changes[i];
-        if (change.is_insertion) continue; // Only process deletions
+        if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) continue; // Only process deletions
         int u = change.u, v = change.v;
         // If the parent of v is u, and the edge (u,v) was in the SSSP tree, mark v
         if (T.parent[v] == u && !G.has_edge(u, v)) {
@@ -223,7 +223,7 @@ void IdentifyAffectedVertices_OpenMP(
     #pragma omp parallel for
     for (size_t i = 0; i < changes.size(); ++i) {
         const auto& change = changes[i];
-        if (change.is_insertion) continue; // Only process deletions
+        if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) continue; // Only process deletions
         int u = change.u, v = change.v;
         // If the parent of v is u, and the edge (u,v) was in the SSSP tree, mark v
         if (T.parent[v] == u) {

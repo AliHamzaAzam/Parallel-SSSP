@@ -81,18 +81,20 @@ int parallel_main(int argc, char* argv[]) {
                  try {
                      if (change.u < 0 || change.u >= graph.num_vertices || change.v < 0 || change.v >= graph.num_vertices) {
                          std::cerr << "Warning: Skipping change due to out-of-bounds vertex index: "
-                                   << (change.is_insertion ? "i " : "d ") << change.u << " " << change.v << std::endl;
+                                   << (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE ? "i/d " : "d/i ")
+                                   << change.u << " " << change.v << std::endl;
                          skipped_changes++;
                          continue;
                      }
-                     if (change.is_insertion) {
+                     if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) {
                          graph.add_edge(change.u, change.v, change.weight);
                      } else {
                          graph.remove_edge(change.u, change.v);
                      }
                  } catch (const std::exception& e) {
                       std::cerr << "Warning: Error applying change ("
-                                << (change.is_insertion ? "insert" : "delete") << " " << change.u << " " << change.v
+                                << (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE ? "insert/decrease" : "delete/increase")
+                                << " " << change.u << " " << change.v
                                 << "). Skipping change. Error: " << e.what() << std::endl;
                       skipped_changes++;
                  }
