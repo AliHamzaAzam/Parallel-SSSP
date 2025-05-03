@@ -3,7 +3,7 @@
 //
 
 #include "../include/utils.hpp"
-#include "../include/graph.h"
+#include "../include/graph.hpp"
 #include <fstream>
 #include <sstream>
 #include <iostream>
@@ -226,42 +226,28 @@ std::vector<EdgeChange> load_edge_changes(const std::string& filename) {
     return changes;
 }
 
-void Graph::to_metis_csr(std::vector<idx_t>& xadj, std::vector<idx_t>& adjncy, std::vector<idx_t>& adjwgt) const {
-    xadj.clear();
-    adjncy.clear();
-    adjwgt.clear();
-
-    xadj.resize(num_vertices + 1);
-    // Calculate exact total degree first for precise allocation
-    size_t total_degree = 0;
-    for (int i = 0; i < num_vertices; ++i) {
-        total_degree += adj[i].size();
-    }
-    adjncy.resize(total_degree); 
-    adjwgt.resize(total_degree); 
-
-    idx_t current_adj_idx = 0;
-    xadj[0] = 0;
-
-    for (int i = 0; i < num_vertices; ++i) {
-        for (const auto& edge : adj[i]) {
-            if (current_adj_idx >= total_degree) {
-                 // This should ideally not happen if total_degree was calculated correctly
-                 throw std::runtime_error("CSR array index out of bounds during creation.");
+// Dijkstra SSSP implementation for shared use
+SSSPResult dijkstra(const Graph& g, int source) {
+    int n = g.num_vertices;
+    SSSPResult result(n);
+    result.dist[source] = 0;
+    using P = std::pair<double, int>;
+    std::priority_queue<P, std::vector<P>, std::greater<P>> pq;
+    pq.push({0, source});
+    while (!pq.empty()) {
+        double d = pq.top().first;
+        int u = pq.top().second;
+        pq.pop();
+        if (d > result.dist[u]) continue;
+        for (const auto& edge : g.neighbors(u)) {
+            int v = edge.to;
+            double weight = edge.weight;
+            if (result.dist[u] + weight < result.dist[v]) {
+                result.dist[v] = result.dist[u] + weight;
+                result.parent[v] = u;
+                pq.push({result.dist[v], v});
             }
-            adjncy[current_adj_idx] = static_cast<idx_t>(edge.to);
-            // METIS expects integer weights. Cast or scale your Weight (double).
-            // Simple cast for now. Consider rounding or scaling based on weight distribution.
-            idx_t weight_val = static_cast<idx_t>(edge.weight);
-            // METIS requires positive weights. If you have 0 or negative, adjust.
-            adjwgt[current_adj_idx] = (weight_val <= 0) ? 1 : weight_val; 
-            current_adj_idx++;
         }
-        xadj[i + 1] = current_adj_idx;
     }
-
-    // Verify final index matches total degree
-    if (current_adj_idx != total_degree) {
-         throw std::runtime_error("CSR final index does not match total degree.");
-    }
+    return result;
 }

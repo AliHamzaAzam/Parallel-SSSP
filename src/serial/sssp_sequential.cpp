@@ -2,8 +2,8 @@
 // Created by Ali Hamza Azam on 25/04/2025.
 //
 
-#include "../include/graph.h"
-#include "../include/utils.hpp"
+#include "../../include/graph.hpp"
+#include "../../include/utils.hpp"
 #include <vector>
 #include <queue>
 #include <limits>
@@ -13,63 +13,37 @@
 // Constants
 #define INF std::numeric_limits<double>::max()
 
-// Baseline Dijkstra Algorithm
-SSSPResult dijkstra(const Graph& g, int source) {
-    SSSPResult result(g.num_vertices);
-    result.dist[source] = 0.0;
+// Baseline Dijkstra Algorithm - REMOVED definition, declared in utils.hpp and defined in utils.cpp
+// SSSPResult dijkstra(const Graph& g, int source) { ... }
 
-    using PDI = std::pair<double, int>; // Pair: distance, vertex
-    std::priority_queue<PDI, std::vector<PDI>, std::greater<PDI>> pq;
 
-    pq.push({0.0, source});
-
-    while (!pq.empty()) {
-        double d = pq.top().first;
-        int u = pq.top().second;
-        pq.pop();
-
-        // Skip if we found a shorter path already
-        if (d > result.dist[u] && result.dist[u] != INFINITY_WEIGHT) {
-             continue;
-        }
-
-        for (const auto& edge : g.adj[u]) {
-            int v = edge.to;
-            double weight = edge.weight;
-            if (result.dist[u] + weight < result.dist[v]) {
-                result.dist[v] = result.dist[u] + weight;
-                result.parent[v] = u;
-                pq.push({result.dist[v], v});
-            }
-        }
-    }
-
-    return result;
-}
-
+// Overload for internal use? Check if this is still needed.
 void dijkstra(const Graph& graph, int start_node, SSSPResult& result) {
     int num_vertices = graph.num_vertices;
     result.dist.assign(num_vertices, INF);
     result.parent.assign(num_vertices, -1);
     result.dist[start_node] = 0;
 
-    std::priority_queue<std::pair<int, int>, std::vector<std::pair<int, int>>, std::greater<std::pair<int, int>>> pq;
-    pq.push({0, start_node});
+    // Use Weight (double) for priority queue distance
+    using PDI = std::pair<Weight, int>;
+    std::priority_queue<PDI, std::vector<PDI>, std::greater<PDI>> pq;
+    pq.push({0.0, start_node}); // Use 0.0 for double
 
     while (!pq.empty()) {
-        int d = pq.top().first;
+        Weight d = pq.top().first; // Use Weight
         int u = pq.top().second;
         pq.pop();
 
-        if (d > result.dist[u]) {
+        // Use INFINITY_WEIGHT for comparison
+        if (d > result.dist[u] && result.dist[u] != INFINITY_WEIGHT) {
             continue;
         }
 
-        for (const auto& edge : graph.adj[u]) {
+        for (const auto& edge : graph.neighbors(u)) { // Use neighbors() for const correctness
             int v = edge.to;
-            int weight = edge.weight;
+            Weight weight = edge.weight; // Use Weight
 
-            if (result.dist[v] > result.dist[u] + weight) {
+            if (result.dist[u] != INFINITY_WEIGHT && result.dist[u] + weight < result.dist[v]) {
                 result.dist[v] = result.dist[u] + weight;
                 result.parent[v] = u;
                 pq.push({result.dist[v], v});

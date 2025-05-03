@@ -1,10 +1,10 @@
-#include "../include/graph.h"
+#include "../../include/graph.hpp"
 #include <mpi.h>
 #include <iostream>
 #include <vector>
 #include <limits>
 #include <algorithm> // For std::min
-#include "../include/utils.hpp" // Make sure this is included for EdgeUpdate
+#include "../../include/utils.hpp"
 #include <unordered_map>
 #include <set>
 #include <unordered_set>

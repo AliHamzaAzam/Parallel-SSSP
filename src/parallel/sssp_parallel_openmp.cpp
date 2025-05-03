@@ -2,8 +2,8 @@
 // Created by Ali Hamza Azam on 25/04/2025.
 //
 
-#include "../include/graph.h" // Use definitions from graph.h
-#include "../include/utils.hpp" // Include utils for EdgeChange if needed, though graph.h has it now
+#include "../../include/graph.hpp"
+#include "../../include/utils.hpp"
 #include <vector>
 #include <limits>
 #include <omp.h>

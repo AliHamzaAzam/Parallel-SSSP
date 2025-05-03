@@ -28,14 +28,8 @@ struct Graph {
 
     Graph(int n) : num_vertices(n), adj(n) {}
 
-    void add_edge(int u, int v, Weight weight) {
-        // Assuming undirected graph for simplicity, add edges in both directions
-        if (u < 0 || u >= num_vertices || v < 0 || v >= num_vertices) {
-             throw std::out_of_range("Vertex index out of range in add_edge");
-        }
-        adj[u].push_back({v, weight});
-        adj[v].push_back({u, weight});
-    }
+    // Declare add_edge here
+    void add_edge(int u, int v, Weight weight);
 
     // Placeholder for removing an edge - requires finding the edge first
     void remove_edge(int u, int v);
@@ -48,17 +42,7 @@ struct Graph {
         return adj[u];
     }
 
-     // Non-const version - return const reference as it doesn't modify state
-     // This was causing issues when called from const Graph objects.
-     // Returning const& should be safe and resolve the const-correctness errors.
-     const std::vector<Edge>& neighbors(int u) { // Changed return type
-          if (u < 0 || u >= num_vertices) {
-             throw std::out_of_range("Vertex index out of range in neighbors()");
-         }
-         return adj[u]; // Return const reference
-     }
-
-    // Method to convert graph to METIS CSR format
+    // Method to convert graph to METIS CSR format - Declaration moved here
     void to_metis_csr(std::vector<idx_t>& xadj, std::vector<idx_t>& adjncy, std::vector<idx_t>& adjwgt) const;
 
     // Method to get the number of unique edges (handles undirected representation)

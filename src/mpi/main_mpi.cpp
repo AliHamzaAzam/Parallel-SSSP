@@ -8,9 +8,8 @@
 #include <mpi.h>
 #include <metis.h>
 
-#include "../include/graph.h"
-#include "../include/utils.hpp"
-#include "sssp_sequential.cpp" // For process_batch_sequential
+#include "../../include/graph.hpp"
+#include "../../include/utils.hpp"
 
 // Forward declaration for the MPI SSSP function
 void SSSP_MPI(const Graph& graph, int source, SSSPResult& result, int argc, char* argv[]);
@@ -71,7 +70,7 @@ Graph extract_local_subgraph(const Graph& global_graph, const std::vector<idx_t>
     return local_graph;
 }
 
-int main(int argc, char* argv[]) {
+int mpi_main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -291,7 +290,7 @@ int main(int argc, char* argv[]) {
             SSSPResult sssp_result(graph.num_vertices);
             sssp_result.dist[start_node] = 0.0;
             for (int i = 0; i < graph.num_vertices; ++i) sssp_result.parent[i] = -1;
-            process_batch_sequential(graph, sssp_result, changes);
+            // process_batch_sequential(graph, sssp_result, changes);
             // Copy results to dist/parent for output
             for (int i = 0; i < graph.num_vertices; ++i) {
                 dist[i] = sssp_result.dist[i];
@@ -364,36 +363,3 @@ int main(int argc, char* argv[]) {
     MPI_Finalize();
     return 0;
 }
-
-// --- Need actual implementation or linking for Dijkstra if used ---
-// Placeholder if not linked elsewhere
-/*
-SSSPResult dijkstra(const Graph& g, int source) {
-    if (source < 0 || source >= g.num_vertices) {
-        throw std::runtime_error("Source node out of range in Dijkstra");
-    }
-    SSSPResult result(g.num_vertices);
-    result.dist[source] = 0;
-    std::priority_queue<std::pair<Weight, int>, std::vector<std::pair<Weight, int>>, std::greater<std::pair<Weight, int>>> pq;
-    pq.push({0, source});
-
-    while (!pq.empty()) {
-        Weight d = pq.top().first;
-        int u = pq.top().second;
-        pq.pop();
-
-        if (d > result.dist[u]) continue;
-
-        for (const auto& edge : g.neighbors(u)) {
-            int v = edge.to;
-            Weight weight = edge.weight;
-            if (result.dist[u] + weight < result.dist[v]) {
-                result.dist[v] = result.dist[u] + weight;
-                result.parent[v] = u;
-                pq.push({result.dist[v], v});
-            }
-        }
-    }
-    return result;
-}
-*/

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 project(Parallel-SSSP)
 
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Use Homebrew LLVM and METIS on macOS
@@ -52,42 +52,53 @@ endif()
 include_directories(include ${METIS_INCLUDE_DIR})
 
 # Add executable for the main SSSP program
-add_executable(Parallel_SSSP
-        src/main.cpp
-        src/sssp_sequential.cpp
-        src/sssp_parallel_openmp.cpp
-        src/utils.cpp
-        src/graph.cpp # Ensure this line is present
+add_executable(SSSP
+    src/main.cpp
+    src/mpi/sssp_parallel_mpi.cpp       # MPI implementation logic
+    src/parallel/sssp_parallel_openmp.cpp # OpenMP implementation logic
+    src/serial/sssp_sequential.cpp    # Sequential implementation logic
+    src/utils.cpp
+    src/graph.cpp
+    # Add back source files defining the mode-specific entry points
+    src/parallel/main_parallel.cpp
+    src/mpi/main_mpi.cpp
 )
 
 # Add executable for the update generator program
 add_executable(generate_updates
-        src/generate_updates.cpp
+        tools/generate_updates.cpp
         src/utils.cpp # Needs utils for load_graph
+        src/graph.cpp # Needs graph implementation used by utils and the tool itself
 )
 
-# Add executable for the MPI version
-add_executable(Parallel_SSSP_MPI
-        src/main_mpi.cpp
-        src/sssp_parallel_mpi.cpp
-        src/utils.cpp
-        src/graph.cpp
+# Link libraries
+# Link SSSP executable
+target_link_libraries(SSSP
+    PRIVATE
+    OpenMP::OpenMP_CXX # Link OpenMP
+    MPI::MPI_CXX       # Link MPI
+    ${METIS_LIBRARY} # Corrected variable name
 )
 
-# Add executable for the Serial version
-add_executable(Parallel_SSSP_SERIAL
-        src/main_serial.cpp
-        src/sssp_sequential.cpp
-        src/utils.cpp
-        src/graph.cpp
+# Link generate_updates executable
+target_link_libraries(generate_updates
+    PRIVATE
+    ${METIS_LIBRARY} # Corrected variable name
 )
-# Link OpenMP to the main program
-target_link_libraries(Parallel_SSSP PRIVATE OpenMP::OpenMP_CXX)
 
-# Link METIS to all executables that might need graph loading/partitioning
-target_link_libraries(Parallel_SSSP PRIVATE ${METIS_LIBRARY})
-target_link_libraries(generate_updates PRIVATE ${METIS_LIBRARY})
-target_link_libraries(Parallel_SSSP_MPI PRIVATE ${METIS_LIBRARY})
+# Add include directories (already present, just ensuring target_include_directories is considered)
+# Using target_include_directories is often preferred over include_directories
+target_include_directories(SSSP PRIVATE include ${METIS_INCLUDE_DIR} ${MPI_CXX_INCLUDE_PATH})
+target_include_directories(generate_updates PRIVATE include ${METIS_INCLUDE_DIR})
 
-# Link MPI libraries to the MPI executable
-target_link_libraries(Parallel_SSSP_MPI PRIVATE MPI::MPI_CXX)
+# Comment out or remove the old commented-out executables if SSSP is the unified one
+# add_executable(Parallel_SSSP ...)
+# add_executable(Parallel_SSSP_MPI ...)
+# add_executable(SSSP_SERIAL ...)
+
+# Ensure OpenMP flags are correctly applied (already handled by find_package and target_link_libraries)
+
+# Ensure C++ standard is set (already done)
+# set(CMAKE_CXX_STANDARD 17)
+# set(CMAKE_CXX_STANDARD_REQUIRED True)
+

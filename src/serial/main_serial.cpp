@@ -3,8 +3,8 @@
 #include <string>
 #include <chrono>
 #include <stdexcept>
-#include "../include/graph.h"
-#include "../include/utils.hpp"
+#include "../../include/graph.hpp"
+#include "../../include/utils.hpp"
 
 SSSPResult dijkstra(const Graph& g, int source);
 void process_batch_sequential(Graph& g, SSSPResult& sssp_result, const std::vector<EdgeChange>& batch);

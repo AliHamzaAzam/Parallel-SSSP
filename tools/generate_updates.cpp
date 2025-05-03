@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <tuple> // For std::ignore
 
-#include "../include/graph.h"
+#include "../include/graph.hpp"
 #include "../include/utils.hpp"
 
 // Helper function to check if an edge exists (considers undirected nature)
