@@ -98,10 +98,11 @@ int main(int argc, char* argv[]) {
 
             if (!edge_exists(u, v, existing_edges)) {
                 double weight = weight_dist(gen);
-                generated_updates.push_back({u, v, weight, true});
+                // Use ChangeType::INSERT instead of boolean true
+                generated_updates.push_back({u, v, weight, ChangeType::INSERT});
                 existing_edges.insert({std::min(u, v), std::max(u, v)});
                 // Add to edge_list as well, so it *could* be deleted later in the sequence
-                edge_list.push_back({std::min(u, v), std::max(u, v)}); 
+                edge_list.push_back({std::min(u, v), std::max(u, v)});
                 generated_count++;
             }
             // Else: edge already exists, try again in the next iteration
@@ -111,16 +112,17 @@ int main(int argc, char* argv[]) {
             if (!edge_list.empty()) {
                  std::uniform_int_distribution<> edge_idx_dist(0, edge_list.size() - 1);
                  int edge_idx = edge_idx_dist(gen);
-                 
+
                  std::pair<int, int> edge_to_delete = edge_list[edge_idx];
                  int u = edge_to_delete.first;
                  int v = edge_to_delete.second;
 
                  // Check if it *still* exists (might have been deleted in a previous step)
                  if (edge_exists(u, v, existing_edges)) {
-                     generated_updates.push_back({u, v, 0.0, false}); // Weight doesn't matter for deletion
+                     // Use ChangeType::DELETE instead of boolean false
+                     generated_updates.push_back({u, v, 0.0, ChangeType::DELETE}); // Weight doesn't matter for deletion
                      existing_edges.erase({u, v}); // Remove canonical form
-                     
+
                      // Remove from edge_list efficiently: swap with last and pop
                      std::swap(edge_list[edge_idx], edge_list.back());
                      edge_list.pop_back();
@@ -148,7 +150,8 @@ int main(int argc, char* argv[]) {
     outfile << "# Generated updates for graph: " << input_graph_file << std::endl;
     outfile << "# Total updates: " << generated_updates.size() << std::endl;
     for (const auto& change : generated_updates) {
-        if (change.is_insertion) {
+        // Check change.type instead of change.is_insertion
+        if (change.type == ChangeType::INSERT) {
             outfile << "i " << change.u << " " << change.v << " " << change.weight << std::endl;
         } else {
             outfile << "d " << change.u << " " << change.v << std::endl;
