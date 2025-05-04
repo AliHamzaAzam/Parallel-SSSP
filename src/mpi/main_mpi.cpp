@@ -13,9 +13,6 @@
 #include "../../include/graph.hpp"
 #include "../../include/utils.hpp"
 
-// --- Move graph definition to global scope ---
-Graph graph(0); // Global graph loaded by all ranks for now
-
 // Forward declaration for the MPI SSSP function
 void SSSP_MPI(const Graph& graph, int source, SSSPResult& result, int argc, char* argv[]);
 // Forward declaration for sequential Dijkstra (needed for baseline/initial compute on rank 0)
@@ -45,7 +42,8 @@ void Distributed_DynamicSSSP_MPI(
     const std::vector<int>& part,     // Changed idx_t to int
     int source,
     const std::vector<bool>& initial_affected_del, // Initial affected_del status for local vertices
-    const std::vector<bool>& initial_affected      // Initial affected status for local vertices
+    const std::vector<bool>& initial_affected,      // Initial affected status for local vertices
+    bool debug_output = false      // Added debug_output parameter
 );
 
 // Add a type alias for clarity
@@ -171,17 +169,28 @@ int mpi_main(int argc, char* argv[]) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    // Add debug flag to control verbose output
+    bool debug_output = false;
+    // Check for environment variable to enable debug output
+    char* debug_env = getenv("SSSP_DEBUG");
+    if (debug_env != nullptr && (strcmp(debug_env, "1") == 0 || 
+                                strcmp(debug_env, "true") == 0 || 
+                                strcmp(debug_env, "yes") == 0)) {
+        debug_output = true;
+        if (rank == 0) std::cout << "Debug output enabled via SSSP_DEBUG environment variable" << std::endl;
+    }
+
     std::string filename;
     int start_node = -1;
     std::string changes_filename = "";
     idx_t num_partitions = size;
-    // Graph graph(0); // <-- REMOVE this local definition
+    Graph graph(0); // Local graph variable
     std::vector<EdgeChange> changes;
     int num_changes = 0;
     SSSPResult initial_sssp_result(0); // Initialize with size 0 using the constructor
     std::vector<bool> affected_del; // For Rank 0 initial calculation
     std::vector<bool> affected;     // For Rank 0 initial calculation
-    std::vector<idx_t> part;         // Partition vector (size known after graph load)
+    std::vector<int> part;         // Partition vector (size known after graph load, use int for MPI_INT)
 
     // --- Argument Parsing and Broadcasting ---
     if (rank == 0) {
@@ -201,7 +210,7 @@ int mpi_main(int argc, char* argv[]) {
         MPI_Bcast(&cfn_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
         if (cfn_len > 0) MPI_Bcast(const_cast<char*>(changes_filename.c_str()), cfn_len + 1, MPI_CHAR, 0, MPI_COMM_WORLD);
         MPI_Bcast(&start_node, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&num_partitions, 1, MPI_INT64_T, 0, MPI_COMM_WORLD); // Assuming idx_t is 64-bit
+        MPI_Bcast(&num_partitions, 1, MPI_INT, 0, MPI_COMM_WORLD);
     } else {
         // Receive parameters
         int fn_len; MPI_Bcast(&fn_len, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -211,7 +220,7 @@ int mpi_main(int argc, char* argv[]) {
         if (cfn_len > 0) { std::vector<char> cfn_buffer(cfn_len + 1); MPI_Bcast(cfn_buffer.data(), cfn_len + 1, MPI_CHAR, 0, MPI_COMM_WORLD); changes_filename = std::string(cfn_buffer.data()); }
         else { changes_filename = ""; }
         MPI_Bcast(&start_node, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&num_partitions, 1, MPI_INT64_T, 0, MPI_COMM_WORLD); // Assuming idx_t is 64-bit
+        MPI_Bcast(&num_partitions, 1, MPI_INT, 0, MPI_COMM_WORLD);
     }
 
     // --- Graph Loading (All ranks load for now) ---
@@ -349,7 +358,7 @@ int mpi_main(int argc, char* argv[]) {
     }
 
     // --- Broadcast Partition Vector ---
-    MPI_Bcast(part.data(), graph.num_vertices, MPI_INT64_T, 0, MPI_COMM_WORLD); // Assuming idx_t is 64-bit
+    MPI_Bcast(part.data(), graph.num_vertices, MPI_INT, 0, MPI_COMM_WORLD);
 
     // --- Data Scattering Preparation ---
     Graph local_graph(0); // Initialize on all ranks
@@ -455,34 +464,66 @@ int mpi_main(int argc, char* argv[]) {
             }
             MPI_Send(adj_sizes.data(), dest_n_local, MPI_INT, dest_rank, 6, MPI_COMM_WORLD);
 
-            MPI_Datatype MPI_Edge; // Recreate MPI_Edge type
-            int blocklengths_edge[2] = {1, 1}; MPI_Aint offsets_edge[2];
-            offsets_edge[0] = offsetof(Edge, to); offsets_edge[1] = offsetof(Edge, weight);
-            MPI_Datatype types_edge[2] = {MPI_INT, MPI_DOUBLE};
-            MPI_Type_create_struct(2, blocklengths_edge, offsets_edge, types_edge, &MPI_Edge);
-            MPI_Type_commit(&MPI_Edge);
-            MPI_Send(adj_data.data(), adj_data.size(), MPI_Edge, dest_rank, 7, MPI_COMM_WORLD);
+            // Create a safer data structure to send Edge data
+            int total_adj_entries = adj_data.size();
+            std::vector<int> adj_destinations(total_adj_entries);     // Edge destinations
+            std::vector<double> adj_weights(total_adj_entries);       // Edge weights
+            
+            // Split Edge objects into separate arrays for safer transmission
+            for (int i = 0; i < total_adj_entries; i++) {
+                adj_destinations[i] = adj_data[i].to;
+                adj_weights[i] = adj_data[i].weight;
+            }
+            
+            // Send the size first
+            MPI_Send(&total_adj_entries, 1, MPI_INT, dest_rank, 7, MPI_COMM_WORLD);
+            
+            // Only send data if there are edges to send
+            if (total_adj_entries > 0) {
+                MPI_Send(adj_destinations.data(), total_adj_entries, MPI_INT, dest_rank, 71, MPI_COMM_WORLD);
+                MPI_Send(adj_weights.data(), total_adj_entries, MPI_DOUBLE, dest_rank, 72, MPI_COMM_WORLD);
+            }
 
             // Send boundary edges map (more complex serialization)
             int boundary_map_size = boundary_edges_to_send.size();
             MPI_Send(&boundary_map_size, 1, MPI_INT, dest_rank, 8, MPI_COMM_WORLD);
 
-            std::vector<int> boundary_keys;
-            std::vector<int> boundary_counts;
-            std::vector<Edge> boundary_data;
-            boundary_keys.reserve(boundary_map_size);
-            boundary_counts.reserve(boundary_map_size);
-
-            for(const auto& pair : boundary_edges_to_send) {
-                boundary_keys.push_back(pair.first); // local source index
-                boundary_counts.push_back(pair.second.size());
-                boundary_data.insert(boundary_data.end(), pair.second.begin(), pair.second.end());
+            // Only proceed with boundary edges if there are any
+            if (boundary_map_size > 0) {
+                std::vector<int> boundary_keys;
+                std::vector<int> boundary_counts;
+                std::vector<int> boundary_destinations;
+                std::vector<double> boundary_weights;
+                
+                boundary_keys.reserve(boundary_map_size);
+                boundary_counts.reserve(boundary_map_size);
+                
+                // Flatten boundary edges into simple arrays
+                int total_boundary_edges = 0;
+                for(const auto& pair : boundary_edges_to_send) {
+                    boundary_keys.push_back(pair.first); // local source index
+                    boundary_counts.push_back(pair.second.size());
+                    total_boundary_edges += pair.second.size();
+                    
+                    // Extract destination and weight information
+                    for (const auto& edge : pair.second) {
+                        boundary_destinations.push_back(edge.to);
+                        boundary_weights.push_back(edge.weight);
+                    }
+                }
+                
+                // Send boundary edge metadata
+                MPI_Send(boundary_keys.data(), boundary_map_size, MPI_INT, dest_rank, 9, MPI_COMM_WORLD);
+                MPI_Send(boundary_counts.data(), boundary_map_size, MPI_INT, dest_rank, 10, MPI_COMM_WORLD);
+                
+                // Send the flattened boundary edge data
+                MPI_Send(&total_boundary_edges, 1, MPI_INT, dest_rank, 11, MPI_COMM_WORLD);
+                
+                if (total_boundary_edges > 0) {
+                    MPI_Send(boundary_destinations.data(), total_boundary_edges, MPI_INT, dest_rank, 111, MPI_COMM_WORLD);
+                    MPI_Send(boundary_weights.data(), total_boundary_edges, MPI_DOUBLE, dest_rank, 112, MPI_COMM_WORLD);
+                }
             }
-            MPI_Send(boundary_keys.data(), boundary_map_size, MPI_INT, dest_rank, 9, MPI_COMM_WORLD);
-            MPI_Send(boundary_counts.data(), boundary_map_size, MPI_INT, dest_rank, 10, MPI_COMM_WORLD);
-            MPI_Send(boundary_data.data(), boundary_data.size(), MPI_Edge, dest_rank, 11, MPI_COMM_WORLD);
-
-            MPI_Type_free(&MPI_Edge); // Free the type after use
 
             std::cout << "[Rank 0] Finished sending data to Rank " << dest_rank << "." << std::endl;
         }
@@ -496,13 +537,34 @@ int mpi_main(int argc, char* argv[]) {
         MPI_Recv(&n_local, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, &status);
         std::cout << "[Rank " << rank << "] Received n_local = " << n_local << "." << std::endl;
 
-        // Resize local vectors
-        local_to_global.resize(n_local);
-        global_to_local.assign(graph.num_vertices, -1);
-        local_dist.resize(n_local);
-        local_parent.resize(n_local);
-        local_affected_del.resize(n_local);
-        local_affected.resize(n_local);
+        // Safety check for n_local value
+        if (n_local <= 0 || n_local > graph.num_vertices) {
+            std::cerr << "[Rank " << rank << "] ERROR: Received invalid n_local value: " << n_local 
+                      << ". Expected a value between 1 and " << graph.num_vertices 
+                      << ". Aborting." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            return 1;
+        }
+
+        // Resize local vectors with try-catch to handle allocation errors
+        try {
+            local_to_global.resize(n_local);
+            
+            // Use vector constructor instead of assign to avoid potential memory issues
+            int n_global = graph.num_vertices;
+            std::vector<int> new_global_to_local(n_global, -1);
+            global_to_local = std::move(new_global_to_local);
+            
+            local_dist.resize(n_local);
+            local_parent.resize(n_local);
+            local_affected_del.resize(n_local);
+            local_affected.resize(n_local);
+        } catch (const std::exception& e) {
+            std::cerr << "[Rank " << rank << "] Memory allocation error: " << e.what() << ". Aborting." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            return 1;
+        }
+        
         std::vector<char> aff_del_char(n_local);
         std::vector<char> aff_char(n_local);
         std::vector<int> adj_sizes(n_local);
@@ -528,19 +590,21 @@ int mpi_main(int argc, char* argv[]) {
 
         // Receive internal adjacency list data (Tags 6, 7)
         MPI_Recv(adj_sizes.data(), n_local, MPI_INT, 0, 6, MPI_COMM_WORLD, &status);
-        int total_adj_entries = 0;
-        for(int s : adj_sizes) total_adj_entries += s;
-        std::vector<Edge> adj_data(total_adj_entries);
-
-        MPI_Datatype MPI_Edge; // Recreate MPI_Edge type
-        int blocklengths_edge[2] = {1, 1}; MPI_Aint offsets_edge[2];
-        offsets_edge[0] = offsetof(Edge, to); offsets_edge[1] = offsetof(Edge, weight);
-        MPI_Datatype types_edge[2] = {MPI_INT, MPI_DOUBLE};
-        MPI_Type_create_struct(2, blocklengths_edge, offsets_edge, types_edge, &MPI_Edge);
-        MPI_Type_commit(&MPI_Edge);
-
-        if (total_adj_entries > 0) { // Only receive if there's data
-             MPI_Recv(adj_data.data(), total_adj_entries, MPI_Edge, 0, 7, MPI_COMM_WORLD, &status);
+        
+        // Receive the size of adjacency data
+        int total_adj_entries;
+        MPI_Recv(&total_adj_entries, 1, MPI_INT, 0, 7, MPI_COMM_WORLD, &status);
+        
+        // Receive edge data as separate arrays
+        std::vector<int> adj_destinations;
+        std::vector<double> adj_weights;
+        
+        if (total_adj_entries > 0) {
+            adj_destinations.resize(total_adj_entries);
+            adj_weights.resize(total_adj_entries);
+            
+            MPI_Recv(adj_destinations.data(), total_adj_entries, MPI_INT, 0, 71, MPI_COMM_WORLD, &status);
+            MPI_Recv(adj_weights.data(), total_adj_entries, MPI_DOUBLE, 0, 72, MPI_COMM_WORLD, &status);
         }
 
         // Reconstruct local graph (internal edges)
@@ -548,11 +612,23 @@ int mpi_main(int argc, char* argv[]) {
         int current_adj_idx = 0;
         for (int u_local = 0; u_local < n_local; ++u_local) {
             for (int i = 0; i < adj_sizes[u_local]; ++i) {
-                if (current_adj_idx < adj_data.size()) { // Bounds check
-                    const Edge& edge = adj_data[current_adj_idx++];
-                    local_graph.add_edge(u_local, edge.to, edge.weight);
+                if (current_adj_idx < total_adj_entries) { // Bounds check
+                    int dest = adj_destinations[current_adj_idx];
+                    double weight = adj_weights[current_adj_idx];
+                    current_adj_idx++;
+                    
+                    // Add sanity check on destination vertex
+                    if (dest >= 0 && dest < n_local) {
+                        local_graph.add_edge(u_local, dest, weight);
+                    } else {
+                        std::cerr << "[Rank " << rank << "] Error: Invalid destination vertex " 
+                                  << dest << " in adjacency list. Valid range is [0, " 
+                                  << (n_local-1) << "]. Skipping." << std::endl;
+                    }
                 } else {
-                     std::cerr << "[Rank " << rank << "] Error: Mismatch in adjacency list reconstruction." << std::endl;
+                     std::cerr << "[Rank " << rank << "] Error: Mismatch in adjacency list reconstruction. "
+                               << "Tried to access index " << current_adj_idx 
+                               << " but array size is " << total_adj_entries << std::endl;
                      break; // Avoid further errors
                 }
             }
@@ -561,40 +637,102 @@ int mpi_main(int argc, char* argv[]) {
         // Receive boundary edges map (Tags 8, 9, 10, 11)
         int boundary_map_size;
         MPI_Recv(&boundary_map_size, 1, MPI_INT, 0, 8, MPI_COMM_WORLD, &status);
+        
+        // Defensive programming - limit boundary map size to avoid potential buffer overflow
+        if (boundary_map_size < 0 || boundary_map_size > n_local) {
+            std::cerr << "[Rank " << rank << "] ERROR: Invalid boundary map size " << boundary_map_size 
+                      << ". Setting to 0 to avoid segmentation fault." << std::endl;
+            boundary_map_size = 0;
+        }
+        
         if (boundary_map_size > 0) {
             std::vector<int> boundary_keys(boundary_map_size);
             std::vector<int> boundary_counts(boundary_map_size);
+            
+            // Receive the keys and counts
             MPI_Recv(boundary_keys.data(), boundary_map_size, MPI_INT, 0, 9, MPI_COMM_WORLD, &status);
             MPI_Recv(boundary_counts.data(), boundary_map_size, MPI_INT, 0, 10, MPI_COMM_WORLD, &status);
 
-            int total_boundary_edges = 0;
-            for(int count : boundary_counts) total_boundary_edges += count;
-            std::vector<Edge> boundary_data(total_boundary_edges);
-
-            if (total_boundary_edges > 0) { // Only receive if there's data
-                MPI_Recv(boundary_data.data(), total_boundary_edges, MPI_Edge, 0, 11, MPI_COMM_WORLD, &status);
+            // Receive the total number of boundary edges
+            int total_boundary_edges;
+            MPI_Recv(&total_boundary_edges, 1, MPI_INT, 0, 11, MPI_COMM_WORLD, &status);
+            
+            // Apply safety checks
+            // Additional bounds check on total size
+            if (total_boundary_edges < 0 || total_boundary_edges > 1000000) {
+                std::cerr << "[Rank " << rank << "] ERROR: Invalid total boundary edges count " 
+                          << total_boundary_edges << " (expected range: 0-1000000). Setting to 0." << std::endl;
+                total_boundary_edges = 0;
+            }
+            
+            // Receive the flattened boundary edge data
+            std::vector<int> boundary_destinations;
+            std::vector<double> boundary_weights;
+            
+            if (total_boundary_edges > 0) {
+                boundary_destinations.resize(total_boundary_edges);
+                boundary_weights.resize(total_boundary_edges);
+                
+                MPI_Recv(boundary_destinations.data(), total_boundary_edges, MPI_INT, 0, 111, MPI_COMM_WORLD, &status);
+                MPI_Recv(boundary_weights.data(), total_boundary_edges, MPI_DOUBLE, 0, 112, MPI_COMM_WORLD, &status);
             }
 
-            // Reconstruct boundary edges map
+            // Validate boundary counts sum matches total_boundary_edges
+            int expected_sum = 0;
+            for(int i = 0; i < boundary_map_size; i++) {
+                if (boundary_counts[i] >= 0) {
+                    expected_sum += boundary_counts[i];
+                } else {
+                    std::cerr << "[Rank " << rank << "] WARNING: Negative boundary count " 
+                              << boundary_counts[i] << ". Setting to 0." << std::endl;
+                    boundary_counts[i] = 0;
+                }
+            }
+            
+            if (expected_sum != total_boundary_edges) {
+                std::cerr << "[Rank " << rank << "] WARNING: Boundary counts sum (" << expected_sum 
+                          << ") doesn't match received total (" << total_boundary_edges 
+                          << "). Using minimum." << std::endl;
+                total_boundary_edges = std::min(expected_sum, total_boundary_edges);
+            }
+
+            // Reconstruct boundary edges map with additional safety checks
             int current_boundary_idx = 0;
             for (int i = 0; i < boundary_map_size; ++i) {
                 int u_local = boundary_keys[i];
                 int count = boundary_counts[i];
+                
+                // Bounds check on local vertex index
+                if (u_local < 0 || u_local >= n_local) {
+                    std::cerr << "[Rank " << rank << "] WARNING: Boundary key " << u_local 
+                              << " is out of bounds [0, " << n_local - 1 << "]. Skipping." << std::endl;
+                    current_boundary_idx += count; // Skip these edges
+                    continue;
+                }
+                
                 std::vector<Edge> edges;
                 edges.reserve(count);
+                
                 for (int j = 0; j < count; ++j) {
-                     if (current_boundary_idx < boundary_data.size()) { // Bounds check
-                        edges.push_back(boundary_data[current_boundary_idx++]);
-                     } else {
-                         std::cerr << "[Rank " << rank << "] Error: Mismatch in boundary edge reconstruction." << std::endl;
-                         break; // Avoid further errors
-                     }
+                    if (current_boundary_idx < total_boundary_edges) {
+                        int dest = boundary_destinations[current_boundary_idx];
+                        double weight = boundary_weights[current_boundary_idx];
+                        current_boundary_idx++;
+                        
+                        // Store the edge
+                        edges.push_back({dest, weight});
+                    } else {
+                        std::cerr << "[Rank " << rank << "] Error: Boundary data index " << current_boundary_idx 
+                                  << " exceeds array size " << total_boundary_edges << std::endl;
+                        break;
+                    }
                 }
-                local_boundary_edges[u_local] = std::move(edges);
+                
+                if (!edges.empty()) {
+                    local_boundary_edges[u_local] = std::move(edges);
+                }
             }
         }
-
-        MPI_Type_free(&MPI_Edge); // Free the type after use
 
         std::cout << "[Rank " << rank << "] Received and reconstructed all data. Local graph vertices: " << local_graph.num_vertices << ", Boundary edge sources: " << local_boundary_edges.size() << std::endl;
     }
@@ -610,18 +748,19 @@ int mpi_main(int argc, char* argv[]) {
     // Call the function that implements Algorithm 3/4 (PASS BOUNDARY EDGES)
     Distributed_DynamicSSSP_MPI(
         local_graph,
-        local_boundary_edges, // Pass the boundary edges map
-        local_to_global,    // Mapping: local index -> global ID
-        global_to_local,    // Mapping: global ID -> local index
-        local_dist,         // Local distance array (input/output)
-        local_parent,       // Local parent array (input/output)
-        changes,            // Full changes list (might not be needed)
+        local_boundary_edges,   // Pass the boundary edges map
+        local_to_global,        // Mapping: local index -> global ID
+        global_to_local,        // Mapping: global ID -> local index
+        local_dist,          // Local distance array (input/output)
+        local_parent,        // Local parent array (input/output)
+        changes,                // Full changes list (might not be needed)
         rank,
         size,
-        part,               // Global partition vector
+        part,                   // Global partition vector
         start_node,
-        local_affected_del, // Initial affected_del status for local vertices
-        local_affected      // Initial affected status for local vertices
+        local_affected_del,     // Initial affected_del status for local vertices
+        local_affected,          // Initial affected status for local vertices
+        debug_output            // Pass the debug_output flag
     );
 
     auto end_update = MPI_Wtime();
@@ -637,32 +776,38 @@ int mpi_main(int argc, char* argv[]) {
         final_global_dist.resize(n_global, INFINITY_WEIGHT); // Initialize on rank 0
         final_global_parent.resize(n_global, -1);          // Initialize on rank 0
 
-        // DEBUG: Print initial final_global_dist before Reduce
-        std::cout << "[Rank 0 DEBUG] Before Reduce, final_global_dist: [ ";
-        for(double d : final_global_dist) std::cout << (d == INFINITY_WEIGHT ? "INF " : std::to_string(d) + " ");
-        std::cout << "]" << std::endl;
-    }
-
-    // Gather distances (using Reduce with MPI_IN_PLACE on rank 0)
-    std::vector<double> local_dist_out(n_global, INFINITY_WEIGHT);
-    // Ensure local_to_global is populated before this loop
-    if (!local_to_global.empty()) { // Add check to prevent crash if setup is incomplete
-        for (int u_local = 0; u_local < (int)local_to_global.size(); ++u_local) { // Use local_to_global size
-            int u_global = local_to_global[u_local];
-            if (u_global >= 0 && u_global < n_global && u_local < local_dist.size()) { // Bounds check for local_dist too
-                 local_dist_out[u_global] = local_dist[u_local]; // Use final local_dist
-            }
+        // Only print debug information when debug_output is enabled
+        if (debug_output) {
+            std::cout << "[Rank 0 DEBUG] Before Reduce, final_global_dist: [ ";
+            for(double d : final_global_dist) std::cout << (d == INFINITY_WEIGHT ? "INF " : std::to_string(d) + " ");
+            std::cout << "]" << std::endl;
         }
     }
-    MPI_Reduce(rank == 0 ? MPI_IN_PLACE : local_dist_out.data(),
-               rank == 0 ? final_global_dist.data() : nullptr,
-               n_global, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+
+    // Gather distances
+    if (size == 1) {
+        // Single-rank: no reduction needed, local_dist covers all vertices
+        if (rank == 0) final_global_dist = local_dist;
+    } else {
+        // Prepare full-length send buffer: map local distances to global positions
+        std::vector<double> dist_send(n_global, INFINITY_WEIGHT);
+        for (size_t u_local = 0; u_local < local_to_global.size(); ++u_local) {
+            int u_global = local_to_global[u_local];
+            if (u_global >= 0 && u_global < n_global) {
+                dist_send[u_global] = local_dist[u_local];
+            }
+        }
+        MPI_Reduce(dist_send.data(), final_global_dist.data(),
+                   n_global, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+    }
 
     if (rank == 0) {
         // DEBUG: Print final_global_dist after Reduce
-        std::cout << "[Rank 0 DEBUG] After Reduce, final_global_dist: [ ";
-        for(double d : final_global_dist) std::cout << (d == INFINITY_WEIGHT ? "INF " : std::to_string(d) + " ");
-        std::cout << "]" << std::endl;
+        if (debug_output) {
+            std::cout << "[Rank 0 DEBUG] After Reduce, final_global_dist: [ ";
+            for(double d : final_global_dist) std::cout << (d == INFINITY_WEIGHT ? "INF " : std::to_string(d) + " ");
+            std::cout << "]" << std::endl;
+        }
     }
 
 
@@ -686,15 +831,19 @@ int mpi_main(int argc, char* argv[]) {
     // Combine gathered parents on Rank 0
     if (rank == 0) {
         // DEBUG: Print gathered_parents after Gather
-        std::cout << "[Rank 0 DEBUG] After Gather, gathered_parents (size " << gathered_parents.size() << "): [ ";
-        for(int p : gathered_parents) std::cout << p << " ";
-        std::cout << "]" << std::endl;
+        if (debug_output) {
+            std::cout << "[Rank 0 DEBUG] After Gather, gathered_parents (size " << gathered_parents.size() << "): [ ";
+            for(int p : gathered_parents) std::cout << p << " ";
+            std::cout << "]" << std::endl;
+        }
 
         // DEBUG: Print partition vector before combining
-        std::cout << "[Rank 0 DEBUG] Partition vector 'part' used for combining: [ ";
-        // Need to cast idx_t potentially if printing directly
-        for(size_t i = 0; i < part.size(); ++i) std::cout << static_cast<int>(part[i]) << " ";
-        std::cout << "]" << std::endl;
+        if (debug_output) {
+            std::cout << "[Rank 0 DEBUG] Partition vector 'part' used for combining: [ ";
+            // Need to cast idx_t potentially if printing directly
+            for(size_t i = 0; i < part.size(); ++i) std::cout << static_cast<int>(part[i]) << " ";
+            std::cout << "]" << std::endl;
+        }
 
 
         for(int i=0; i<n_global; ++i) {
@@ -719,9 +868,11 @@ int mpi_main(int argc, char* argv[]) {
         }
 
         // DEBUG: Print final_global_parent after combining
-        std::cout << "[Rank 0 DEBUG] After Combine, final_global_parent: [ ";
-        for(int p : final_global_parent) std::cout << p << " ";
-        std::cout << "]" << std::endl;
+        if (debug_output) {
+            std::cout << "[Rank 0 DEBUG] After Combine, final_global_parent: [ ";
+            for(int p : final_global_parent) std::cout << p << " ";
+            std::cout << "]" << std::endl;
+        }
     }
 
 
@@ -745,6 +896,11 @@ int mpi_main(int argc, char* argv[]) {
         std::cout << "\nExecution finished." << std::endl;
     }
 
+    // ===== Cleanup: Let destructors handle resource release =====
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) {
+        std::cout << "Finalizing MPI..." << std::endl;
+    }
     MPI_Finalize();
     return 0;
 }

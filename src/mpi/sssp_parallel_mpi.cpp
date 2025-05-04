@@ -133,10 +133,7 @@ void SSSP_MPI(const Graph& graph, int source, SSSPResult& result, int argc, char
 
     if (rank == 0) {
         std::cout << "[SSSP_MPI] Computation finished." << std::endl;
-        // You might want to print results or timing here
-        // Timing 
-        
-
+        // Timing information will be handled by the caller (main_mpi.cpp)
     }
 }
 
@@ -359,26 +356,47 @@ void Distributed_UpdateAffected_MPI(
     std::vector<bool>& affected, // Note: This isn't actually used in the current relaxation logic, but kept for signature compatibility
     int my_rank,
     int num_ranks,
-    const std::vector<int>& part // Global partition array (int, not idx_t)
+    const std::vector<int>& part, // Global partition array (int, not idx_t)
+    bool debug_output = false // Add debug_output parameter with default value
 ) {
     int n_local = local_graph.num_vertices;
     int n_global = part.size(); // Get global size from partition array
+    
+    // Safety check to prevent allocation of very large buffers
+    if (n_global > 1000000) {
+        if (my_rank == 0) {
+            std::cerr << "WARNING: Very large global vertex count: " << n_global 
+                      << ". This may cause memory issues." << std::endl;
+        }
+    }
+    
     if (my_rank == 0) std::cout << "[Rank 0] UpdateAffected: Starting. n_local=" << n_local << ", n_global=" << n_global << std::endl;
 
     bool local_changed_in_iter = true;
     int iteration = 0;
 
-    // Buffer to hold distances from this rank to be sent in Allreduce
-    std::vector<double> send_dist_buffer(n_global, INFINITY_WEIGHT);
-    // Buffer to receive the minimum distances across all ranks for all global vertices
-    std::vector<double> current_global_dist(n_global, INFINITY_WEIGHT);
+    // Allocate buffers with safety checks
+    std::vector<double> send_dist_buffer;
+    std::vector<double> current_global_dist;
+    
+    try {
+        // Buffer to hold distances from this rank to be sent in Allreduce
+        send_dist_buffer.resize(n_global, INFINITY_WEIGHT);
+        // Buffer to receive the minimum distances across all ranks for all global vertices
+        current_global_dist.resize(n_global, INFINITY_WEIGHT);
+    } catch (const std::bad_alloc& e) {
+        std::cerr << "[Rank " << my_rank << "] ERROR: Memory allocation failed: " << e.what() 
+                  << ". Try reducing problem size or using more processes." << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+        return;
+    }
 
     while (true) {
         iteration++;
         local_changed_in_iter = false;
 
         // --- DEBUG PRINT: State at start of iteration (Rank 3 only) ---
-        if (my_rank == 3) {
+        if (debug_output && my_rank == 3) {
             std::cout << "[Rank 3 DEBUG] Iter " << iteration << " Start | Dist: [ ";
             for(double d : dist) std::cout << (d == INFINITY_WEIGHT ? "INF " : std::to_string(d) + " ");
             std::cout << "] | Parent: [ ";
@@ -386,7 +404,6 @@ void Distributed_UpdateAffected_MPI(
             std::cout << "]" << std::endl;
         }
         // --- END DEBUG ---
-
 
         // --- Communication Step: Gather current minimum distances for all global vertices --- //
         // 1. Prepare local distances for sending (map local -> global)
@@ -405,152 +422,106 @@ void Distributed_UpdateAffected_MPI(
         }
 
         // 2. Perform Allreduce to get the minimum distance for each global vertex across all ranks
-        std::fill(current_global_dist.begin(), current_global_dist.end(), INFINITY_WEIGHT); // Reset receive buffer
-        MPI_Allreduce(send_dist_buffer.data(), current_global_dist.data(), n_global, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+        // Added error handling for MPI operations
+        int mpi_result = MPI_Allreduce(send_dist_buffer.data(), current_global_dist.data(), n_global, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+        if (mpi_result != MPI_SUCCESS) {
+            std::cerr << "[Rank " << my_rank << "] MPI_Allreduce failed. Aborting." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, mpi_result);
+            return;
+        }
 
         // --- Local Relaxation Step --- //
         bool changed_this_pass = false;
-        if (n_local > 0) {
-            // Iterate through each local vertex v_local
-            for (int v_local = 0; v_local < n_local; ++v_local) {
-                int v_global = local_to_global[v_local]; // Global ID of the current local vertex
-                double current_dist_v = dist[v_local]; // Current best distance to v_local
-                int current_parent_v = parent[v_local]; // Current parent of v_local (can be local index or global index)
-                bool updated = false;
+        
+        // --- REVISED Local Relaxation Step --- //
+        // Iterate through all local source vertices u_local
+        for (int u_local = 0; u_local < n_local; ++u_local) {
+             double dist_u = dist[u_local];
+             if (dist_u == INFINITY_WEIGHT) continue; // Cannot relax from infinity
 
-                // A) Relax using incoming INTERNAL edges (u_local -> v_local)
-                // Iterate through potential local predecessors u_local
-                // Note: This requires iterating through the adjacency list *backwards* or having a reverse graph.
-                // A more efficient way is to iterate through all local u and relax its outgoing edges.
-                // Let's switch to the standard forward relaxation approach:
-                // Iterate through all local u_local and relax edges u_local -> v_local where v_local is also local.
+             // A) Relax outgoing INTERNAL edges (u_local -> v_local)
+             for (const auto& edge : local_graph.neighbors(u_local)) {
+                 int v_local = edge.to; // Destination is local
+                 
+                 // Bounds check to prevent segfault
+                 if (v_local < 0 || v_local >= n_local) {
+                     std::cerr << "[Rank " << my_rank << "] WARNING: Edge destination " << v_local 
+                               << " out of bounds [0," << (n_local-1) << "]. Skipping." << std::endl;
+                     continue;
+                 }
+                 
+                 double weight = edge.weight;
+                 if (dist_u + weight < dist[v_local]) {
+                     // --- DEBUG PRINT: Internal Relaxation (Rank 3 only) ---
+                     if (debug_output && my_rank == 3) {
+                         std::cout << "[Rank 3 DEBUG] Iter " << iteration << " Relax Internal: "
+                                   << local_to_global[u_local] << " -> " << local_to_global[v_local]
+                                   << " | NewDist=" << (dist_u + weight) << " | OldDist=" << dist[v_local] << std::endl;
+                     }
+                     // --- END DEBUG ---
+                     dist[v_local] = dist_u + weight;
+                     // Store the GLOBAL ID of the parent
+                     if (u_local >= 0 && u_local < local_to_global.size()) { // Bounds check
+                        parent[v_local] = local_to_global[u_local];
+                     } else {
+                        parent[v_local] = -1; // Should not happen
+                     }
+                     changed_this_pass = true;
+                 }
+             }
 
-                // B) Relax using incoming BOUNDARY edges (u_global_remote -> v_local)
-                // Use the precomputed local_boundary_edges map.
-                // Key: v_local (local destination), Value: vector of Edge{u_global_remote, weight}
-                auto boundary_it = local_boundary_edges.find(v_local);
-                if (boundary_it != local_boundary_edges.end()) {
-                    const auto& incoming_edges = boundary_it->second;
-                    for (const auto& edge : incoming_edges) {
-                        int u_global_remote = edge.to; // The 'to' field stores the global source vertex ID
-                        double weight = edge.weight;
-                        double dist_u_global = INFINITY_WEIGHT;
-
-                        // Get the current best distance to the remote source u_global_remote from the gathered data
-                        if (u_global_remote >= 0 && u_global_remote < n_global) {
-                             dist_u_global = current_global_dist[u_global_remote];
-                        } else {
-                             if (my_rank == 0) std::cerr << "Warning: Invalid remote global source index " << u_global_remote << " in boundary edge for local vertex " << v_local << " (global " << v_global << ") in rank " << my_rank << std::endl;
-                             continue; // Skip this edge if the source index is invalid
-                        }
-
-                        // Relaxation check
-                        if (dist_u_global != INFINITY_WEIGHT && dist_u_global + weight < current_dist_v) {
-                            current_dist_v = dist_u_global + weight;
-                            // Parent is remote, store its global ID.
-                            current_parent_v = u_global_remote;
-                            updated = true;
-                            // Debug log (optional)
-                            // std::cout << "[Rank " << my_rank << "] Relax Boundary: " << u_global_remote << " -> " << v_local << " (" << v_global << ") | NewDist=" << current_dist_v << " | OldDist=" << dist[v_local] << std::endl;
-                        }
-                    }
-                }
-
-                // Update the local distance and parent if relaxation occurred *from boundary edges*
-                // We need to handle internal edges separately.
-                // Let's restructure the relaxation: Iterate through local U, relax its outgoing edges.
-
-            } // end loop over v_local (OLD STRUCTURE - TO BE REPLACED)
-
-
-            // --- REVISED Local Relaxation Step --- //
-            // Iterate through all local source vertices u_local
-            for (int u_local = 0; u_local < n_local; ++u_local) {
-                 double dist_u = dist[u_local];
-                 if (dist_u == INFINITY_WEIGHT) continue; // Cannot relax from infinity
-
-                 // A) Relax outgoing INTERNAL edges (u_local -> v_local)
-                 for (const auto& edge : local_graph.neighbors(u_local)) {
-                     int v_local = edge.to; // Destination is local
+             // C) Relax incoming BOUNDARY edges (u_global_remote -> u_local)
+             int u_global = local_to_global[u_local]; // Global ID of the current local vertex u_local
+             auto boundary_it = local_boundary_edges.find(u_local); // Find incoming edges to u_local
+             if (boundary_it != local_boundary_edges.end()) {
+                 const auto& incoming_edges = boundary_it->second;
+                 for (const auto& edge : incoming_edges) {
+                     int source_global_remote = edge.to; // Global ID of the remote source
                      double weight = edge.weight;
-                     if (dist_u + weight < dist[v_local]) {
-                         // --- DEBUG PRINT: Internal Relaxation (Rank 3 only) ---
-                         if (my_rank == 3) {
-                             std::cout << "[Rank 3 DEBUG] Iter " << iteration << " Relax Internal: "
-                                       << local_to_global[u_local] << " -> " << local_to_global[v_local]
-                                       << " | NewDist=" << (dist_u + weight) << " | OldDist=" << dist[v_local] << std::endl;
+                     double dist_source_global = INFINITY_WEIGHT;
+
+                     // Get distance to remote source from gathered data with bounds checking
+                     if (source_global_remote >= 0 && source_global_remote < n_global) {
+                         dist_source_global = current_global_dist[source_global_remote];
+                     } else {
+                          if (my_rank == 0) std::cerr << "Warning: Invalid remote global source index " << source_global_remote << " in boundary edge for local vertex " << u_local << " (global " << u_global << ") in rank " << my_rank << std::endl;
+                          continue;
+                     }
+
+                     // Relaxation check
+                     if (dist_source_global != INFINITY_WEIGHT && dist_source_global + weight < dist[u_local]) {
+                         // --- DEBUG PRINT: Boundary Relaxation (Rank 3 only) ---
+                         if (debug_output && my_rank == 3) {
+                             std::cout << "[Rank 3 DEBUG] Iter " << iteration << " Relax Boundary: "
+                                       << source_global_remote << " -> " << u_global
+                                       << " | NewDist=" << (dist_source_global + weight) << " | OldDist=" << dist[u_local] << std::endl;
                          }
                          // --- END DEBUG ---
-                         dist[v_local] = dist_u + weight;
-                         // Store the GLOBAL ID of the parent
-                         if (u_local >= 0 && u_local < local_to_global.size()) { // Bounds check
-                            parent[v_local] = local_to_global[u_local];
-                         } else {
-                            parent[v_local] = -1; // Should not happen
-                         }
+                         dist[u_local] = dist_source_global + weight;
+                         parent[u_local] = source_global_remote; // Parent is remote, store global ID
                          changed_this_pass = true;
-                         // Debug log (optional)
-                         // std::cout << "[Rank " << my_rank << "] Relax Internal: " << u_local << " (" << local_to_global[u_local] << ") -> " << v_local << " (" << local_to_global[v_local] << ") | NewDist=" << dist[v_local] << std::endl;
                      }
                  }
-
-                 // B) Relax outgoing BOUNDARY edges (u_local -> v_global_remote)
-                 // This step is implicitly handled by other ranks relaxing their *incoming* boundary edges
-                 // using the distances gathered via MPI_Allreduce. We don't need to explicitly relax outgoing
-                 // boundary edges here because the effect is captured when the destination rank (which owns v_global_remote)
-                 // performs its relaxation step using the `current_global_dist` which includes our `dist_u`.
-
-                 // C) Relax incoming BOUNDARY edges (u_global_remote -> u_local)
-                 // This needs to be done for the current u_local as the destination.
-                 int u_global = local_to_global[u_local]; // Global ID of the current local vertex u_local
-                 auto boundary_it = local_boundary_edges.find(u_local); // Find incoming edges to u_local
-                 if (boundary_it != local_boundary_edges.end()) {
-                     const auto& incoming_edges = boundary_it->second;
-                     for (const auto& edge : incoming_edges) {
-                         int source_global_remote = edge.to; // Global ID of the remote source
-                         double weight = edge.weight;
-                         double dist_source_global = INFINITY_WEIGHT;
-
-                         // Get distance to remote source from gathered data
-                         if (source_global_remote >= 0 && source_global_remote < n_global) {
-                             dist_source_global = current_global_dist[source_global_remote];
-                         } else {
-                              if (my_rank == 0) std::cerr << "Warning: Invalid remote global source index " << source_global_remote << " in boundary edge for local vertex " << u_local << " (global " << u_global << ") in rank " << my_rank << std::endl;
-                              continue;
-                         }
-
-                         // Relaxation check
-                         if (dist_source_global != INFINITY_WEIGHT && dist_source_global + weight < dist[u_local]) {
-                             // --- DEBUG PRINT: Boundary Relaxation (Rank 3 only) ---
-                             if (my_rank == 3) {
-                                 std::cout << "[Rank 3 DEBUG] Iter " << iteration << " Relax Boundary: "
-                                           << source_global_remote << " -> " << u_global
-                                           << " | NewDist=" << (dist_source_global + weight) << " | OldDist=" << dist[u_local] << std::endl;
-                             }
-                             // --- END DEBUG ---
-                             dist[u_local] = dist_source_global + weight;
-                             parent[u_local] = source_global_remote; // Parent is remote, store global ID
-                             changed_this_pass = true;
-                         }
-                     }
-                 }
-            } // end loop over u_local (REVISED STRUCTURE)
-
-        } // end if (n_local > 0)
+             }
+        } // end loop over u_local
 
         local_changed_in_iter = changed_this_pass;
 
         // --- DEBUG PRINT: Changed Flag (Rank 3 only) ---
-        if (my_rank == 3) {
+        if (debug_output && my_rank == 3) {
             std::cout << "[Rank 3 DEBUG] Iter " << iteration << " End | changed_this_pass=" << (changed_this_pass ? "true" : "false") << std::endl;
         }
         // --- END DEBUG ---
 
-
         // --- Global Convergence Check --- //
         int local_flag = local_changed_in_iter ? 1 : 0;
         int global_flag = 0;
-        MPI_Allreduce(&local_flag, &global_flag, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        mpi_result = MPI_Allreduce(&local_flag, &global_flag, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        if (mpi_result != MPI_SUCCESS) {
+            std::cerr << "[Rank " << my_rank << "] MPI_Allreduce for convergence check failed. Aborting." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, mpi_result);
+            return;
+        }
 
         if (my_rank == 0) std::cout << "[Rank 0] UpdateAffected Iteration " << iteration << ", Global Change Flag: " << global_flag << std::endl;
 
@@ -564,6 +535,14 @@ void Distributed_UpdateAffected_MPI(
         if (iteration > n_global + 1) { // Allow one extra iteration for propagation
              if (my_rank == 0) std::cerr << "Warning: UpdateAffected reached max iterations (" << iteration << "). Potential issue or slow convergence?" << std::endl;
              break;
+        }
+        
+        // Secondary safeguard to prevent excessive iterations
+        if (iteration > 1000) {
+            std::cerr << "[Rank " << my_rank << "] WARNING: Excessive iterations reached (" << iteration 
+                      << "). Forcing termination." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, 1);
+            return;
         }
     } // end while loop
 
@@ -584,94 +563,58 @@ void Distributed_DynamicSSSP_MPI(
     const std::vector<int>& part, // Changed idx_t to int
     int source, // <-- new argument
     const std::vector<bool>& initial_affected_del, // Added missing parameter
-    const std::vector<bool>& initial_affected      // Added missing parameter
+    const std::vector<bool>& initial_affected,      // Added missing parameter
+    bool debug_output = false      // Added debug_output parameter
 ) {
     int n_local = local_graph.num_vertices;
-    int n_global = part.size(); // Keep this definition
+    int n_global = part.size();
 
-    // 1. Apply changes to local subgraph (insertions/deletions)
-    // This section seems incorrect based on the logic in main_mpi.cpp
-    // where changes are applied globally before partitioning.
-    // If changes are applied *before* scattering, this local application is redundant
-    // and potentially harmful if local_graph doesn't perfectly match the global state.
-    // Commenting out for now, assuming main_mpi.cpp handles changes correctly before this call.
-    /*
-    for (const auto& change : changes) {
-        int u = change.u, v = change.v;
-        int u_local = (u >= 0 && u < (int)global_to_local.size()) ? global_to_local[u] : -1;
-        int v_local = (v >= 0 && v < (int)global_to_local.size()) ? global_to_local[v] : -1;
-        if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) { // Insertion or weight decrease
-            if (u_local != -1 && v_local != -1) {
-                // Check if edge already exists before adding? Graph::add_edge might handle this.
-                local_graph.add_edge(u_local, v_local, change.weight);
-            }
-        } else { // Deletion or weight increase (treat increase as delete+insert?)
-                 // The logic here might need refinement depending on how increases are handled.
-            if (u_local != -1 && v_local != -1) {
-                local_graph.remove_edge(u_local, v_local);
-            }
-        }
-    }
-    */
-
-    // 2. Identify affected vertices (with descendant propagation)
     // Use initial_affected instead of recalculating from scratch
-    std::vector<bool> affected = initial_affected; // Initialize with provided status
+    std::vector<bool> affected = initial_affected;
 
-    // Remove redundant definition of n_global
-    // int n_global = part.size();
-
-    // Gather global parent array for propagation (if needed) - This seems unnecessary if initial_affected is correct
-    /*
-    std::vector<int> global_parent(n_global, -1);
-    std::vector<int> local_parent_out(n_global, -1);
-    for (int u_local = 0; u_local < (int)local_to_global.size(); ++u_local) {
-        int u_global = local_to_global[u_local];
-        if (u_global >= 0 && u_global < n_global) { // Bounds check
-             if (u_local >= 0 && u_local < parent.size()) { // Bounds check
-                local_parent_out[u_global] = parent[u_local];
-             }
-        }
-    }
-    // Using MPI_MAX might be incorrect for parent IDs (-1 vs valid IDs). MPI_REPLACE might be better if needed.
-    MPI_Allreduce(local_parent_out.data(), global_parent.data(), n_global, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
-    */
-    // Distributed_IdentifyAffected_MPI(...) call removed as initial_affected is used directly.
-
-
-    // 3. Invalidate affected vertices and descendants
-    std::cout << "[Rank " << my_rank << "] Invalidating locally affected vertices..." << std::endl; // Added log
-    int invalidated_count = 0; // Added counter
+    // Invalidate affected vertices and descendants
+    std::cout << "[Rank " << my_rank << "] Invalidating locally affected vertices..." << std::endl;
+    int invalidated_count = 0;
     for (int u_local = 0; u_local < n_local; ++u_local) {
         // Use initial_affected_del to decide which vertices to fully invalidate
-        if (u_local < initial_affected_del.size() && initial_affected_del[u_local]) { // Bounds check
+        if (u_local < initial_affected_del.size() && initial_affected_del[u_local]) {
             dist[u_local] = INFINITY_WEIGHT;
             parent[u_local] = -1;
-             if (u_local < affected.size()) affected[u_local] = true; // Ensure marked for update
-             invalidated_count++;
+            if (u_local < affected.size()) affected[u_local] = true; // Ensure marked for update
+            invalidated_count++;
         }
         // Ensure vertices only in initial_affected are also marked
         else if (u_local < initial_affected.size() && initial_affected[u_local]) {
-             if (u_local < affected.size()) affected[u_local] = true;
+            if (u_local < affected.size()) affected[u_local] = true;
         }
     }
-     std::cout << "[Rank " << my_rank << "] Invalidated " << invalidated_count << " vertices based on initial_affected_del." << std::endl; // Added log
-
+    std::cout << "[Rank " << my_rank << "] Invalidated " << invalidated_count << " vertices based on initial_affected_del." << std::endl;
 
     // Re-initialize the source node if it is local
     if (source >= 0 && source < (int)global_to_local.size() && global_to_local[source] != -1) {
         int src_local = global_to_local[source];
-         if (src_local >= 0 && src_local < n_local) { // Bounds check
+        if (src_local >= 0 && src_local < n_local) { // Bounds check
             dist[src_local] = 0.0;
             parent[src_local] = -1; // Source has no parent
-             if (src_local < affected.size()) affected[src_local] = true; // Source might need to propagate updates
-             std::cout << "[Rank " << my_rank << "] Re-initialized local source vertex " << src_local << " (global " << source << ")." << std::endl; // Added log
-         }
+            if (src_local < affected.size()) affected[src_local] = true; // Source might need to propagate updates
+            std::cout << "[Rank " << my_rank << "] Re-initialized local source vertex " << src_local << " (global " << source << ")." << std::endl;
+        }
     }
 
-    // 4. Update affected vertices (full reconnection)
-    // Pass local_boundary_edges
-    Distributed_UpdateAffected_MPI(local_graph, local_boundary_edges, local_to_global, global_to_local, dist, parent, affected, my_rank, num_ranks, part);
+    // Update affected vertices (full reconnection)
+    Distributed_UpdateAffected_MPI(
+        local_graph, 
+        local_boundary_edges, 
+        local_to_global, 
+        global_to_local, 
+        dist, 
+        parent, 
+        affected, 
+        my_rank, 
+        num_ranks, 
+        part,
+        debug_output // Pass debug_output parameter to control verbose output
+    );
 
-     std::cout << "[Rank " << my_rank << "] Exiting Distributed_DynamicSSSP_MPI." << std::endl; // Added log
+    std::cout << "[Rank " << my_rank << "] Exiting Distributed_DynamicSSSP_MPI." << std::endl;
 }
