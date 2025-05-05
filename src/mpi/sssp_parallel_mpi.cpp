@@ -41,6 +41,7 @@ void Distributed_IdentifyAffected_MPI(
     int n_global = part.size();
     // Step 1: Mark directly affected vertices locally
     std::vector<bool> affected_global(n_global, false);
+    #pragma omp parallel for schedule(static)
     for (const auto& change : changes) {
         if (change.type == ChangeType::DELETE || change.type == ChangeType::INCREASE) { // Deletion or weight increase
             int u = change.u, v = change.v;
@@ -135,6 +136,7 @@ void Distributed_UpdateAffected_MPI(
         // 1. Prepare local distances for sending (map local -> global)
         std::fill(send_dist_buffer.begin(), send_dist_buffer.end(), INFINITY_WEIGHT);
         if (n_local > 0) {
+            #pragma omp parallel for schedule(static)
             for (int u_local = 0; u_local < n_local; ++u_local) {
                 int u_global = local_to_global[u_local];
                 // Ensure u_global is valid before accessing send_dist_buffer
@@ -166,6 +168,7 @@ void Distributed_UpdateAffected_MPI(
             if (dist_u == INFINITY_WEIGHT) continue;
 
             // Internal edges relaxation
+            #pragma omp parallel for schedule(dynamic) reduction(+:changed_this_pass)
             for (const auto& edge : local_graph.neighbors(u_local)) {
                 const int v_local = edge.to;
                 if (const double weight = edge.weight; dist_u + weight < dist[v_local]) {

@@ -93,6 +93,7 @@ void setup_local_data(
     //    (For ranks > 0, this will be overwritten by received data later)
     if (my_rank == 0) {
          std::cout << "[Rank 0] Populating local state from initial SSSP result." << std::endl;
+        #pragma omp parallel for schedule(static)
          for (int u_local = 0; u_local < n_local; ++u_local) {
              const int u_global = local_to_global[u_local];
              // Add bounds check for safety
@@ -330,6 +331,7 @@ int mpi_main(int argc, char* argv[]) {
         }
 
         // Process Insertions/Decreases
+        #pragma omp parallel for schedule(dynamic)
         for (const auto& change : changes) {
              // Only handle decrease/insert here
              if (change.type != ChangeType::DECREASE && change.type != ChangeType::INSERT) continue;
@@ -576,6 +578,7 @@ int mpi_main(int argc, char* argv[]) {
         for(int i=0; i<n_local; ++i) local_affected[i] = aff_char[i];
 
         // Rebuild global_to_local map
+        #pragma omp parallel for schedule(static)
         for(int u_local = 0; u_local < n_local; ++u_local) {
             if (local_to_global[u_local] >= 0 && local_to_global[u_local] < global_to_local.size()) { // Bounds check
                 global_to_local[local_to_global[u_local]] = u_local;
@@ -673,6 +676,7 @@ int mpi_main(int argc, char* argv[]) {
 
             // Validate boundary counts sum matches total_boundary_edges
             int expected_sum = 0;
+            #pragma omp parallel for reduction(+:expected_sum) schedule(static)
             for(int i = 0; i < boundary_map_size; i++) {
                 if (boundary_counts[i] >= 0) {
                     expected_sum += boundary_counts[i];
