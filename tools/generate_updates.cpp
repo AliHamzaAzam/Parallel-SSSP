@@ -1,3 +1,8 @@
+// generate_updates.cpp - Generate random edge-change sequences for dynamic SSSP
+// ----------------------------------------------------------------------------
+// Loads a graph, then produces a mix of INSERT and DELETE operations
+// and writes them to an updates file.
+
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -6,16 +11,20 @@
 #include <set>
 #include <stdexcept>
 #include <algorithm>
-#include <tuple> // For std::ignore
+#include <tuple>
 
 #include "../include/graph.hpp"
 #include "../include/utils.hpp"
 
-// Helper function to check if an edge exists (considers undirected nature)
-bool edge_exists(int u, int v, const std::set<std::pair<int, int>>& existing_edges) {
+// edge_exists: returns true if undirected edge (u,v) is in existing_edges
+inline bool edge_exists(int u, int v, const std::set<std::pair<int, int>>& existing_edges) {
     return existing_edges.count({std::min(u, v), std::max(u, v)});
 }
 
+// main: generate 'num_updates' edge changes for 'input_graph_file' and write to 'output_updates_file'
+// Args:
+//   argc==4: input_graph_file, output_updates_file, num_updates
+// Exits with code 0 on success, 1 on errors.
 int main(int argc, char* argv[]) {
     if (argc != 4) {
         std::cerr << "Usage: " << argv[0] << " <input_graph_file> <output_updates_file> <num_updates>" << std::endl;
@@ -55,15 +64,13 @@ int main(int argc, char* argv[]) {
     std::vector<EdgeChange> generated_updates;
     generated_updates.reserve(num_updates);
 
-    // Use a set to keep track of existing edges for efficient lookup during insertion
-    // Store edges in a canonical form (min_node, max_node) to handle undirected nature easily
+    // Build set and list of current edges in canonical form
     std::set<std::pair<int, int>> existing_edges;
     std::vector<std::pair<int, int>> edge_list; // For selecting random edges to delete
     edge_list.reserve(graph.get_edge_count()); // Approximate size
 
     for (int u = 0; u < graph.num_vertices; ++u) {
         for (const auto& edge : graph.adj[u]) {
-            // Only add edge once for undirected representation in the set/list
             if (u < edge.to) {
                 existing_edges.insert({u, edge.to});
                 edge_list.push_back({u, edge.to});
@@ -75,7 +82,6 @@ int main(int argc, char* argv[]) {
         std::cout << "Warning: Graph has vertices but no edges. Only insertions will be generated." << std::endl;
     }
 
-
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<> vertex_dist(0, graph.num_vertices - 1);
@@ -86,60 +92,51 @@ int main(int argc, char* argv[]) {
     int max_attempts = num_updates * 100; // Limit attempts to avoid infinite loops
     int attempts = 0;
 
+    // Randomly generate INSERT or DELETE operations until desired count
     while (generated_count < num_updates && attempts < max_attempts) {
         attempts++;
         bool try_insert = (edge_list.empty() || action_dist(gen) < 0.5); // 50% chance, or always insert if no edges to delete
 
         if (try_insert) {
-            // --- Try Insertion ---
             int u = vertex_dist(gen);
             int v = vertex_dist(gen);
             if (u == v) continue; // Avoid self-loops
 
             if (!edge_exists(u, v, existing_edges)) {
                 double weight = weight_dist(gen);
-                // Use ChangeType::INSERT instead of boolean true
                 generated_updates.push_back({u, v, weight, ChangeType::INSERT});
                 existing_edges.insert({std::min(u, v), std::max(u, v)});
-                // Add to edge_list as well, so it *could* be deleted later in the sequence
                 edge_list.push_back({std::min(u, v), std::max(u, v)});
                 generated_count++;
             }
-            // Else: edge already exists, try again in the next iteration
 
         } else {
-            // --- Try Deletion ---
             if (!edge_list.empty()) {
-                 std::uniform_int_distribution<> edge_idx_dist(0, edge_list.size() - 1);
-                 int edge_idx = edge_idx_dist(gen);
+                std::uniform_int_distribution<> edge_idx_dist(0, edge_list.size() - 1);
+                int edge_idx = edge_idx_dist(gen);
 
-                 std::pair<int, int> edge_to_delete = edge_list[edge_idx];
-                 int u = edge_to_delete.first;
-                 int v = edge_to_delete.second;
+                std::pair<int, int> edge_to_delete = edge_list[edge_idx];
+                int u = edge_to_delete.first;
+                int v = edge_to_delete.second;
 
-                 // Check if it *still* exists (might have been deleted in a previous step)
-                 if (edge_exists(u, v, existing_edges)) {
-                     // Use ChangeType::DELETE instead of boolean false
-                     generated_updates.push_back({u, v, 0.0, ChangeType::DELETE}); // Weight doesn't matter for deletion
-                     existing_edges.erase({u, v}); // Remove canonical form
+                if (edge_exists(u, v, existing_edges)) {
+                    generated_updates.push_back({u, v, 0.0, ChangeType::DELETE}); // Weight doesn't matter for deletion
+                    existing_edges.erase({u, v}); // Remove canonical form
 
-                     // Remove from edge_list efficiently: swap with last and pop
-                     std::swap(edge_list[edge_idx], edge_list.back());
-                     edge_list.pop_back();
+                    std::swap(edge_list[edge_idx], edge_list.back());
+                    edge_list.pop_back();
 
-                     generated_count++;
-                 }
-                 // Else: edge was already deleted (or somehow removed), try again
+                    generated_count++;
+                }
             }
-             // If edge_list became empty during generation, the next iteration will force insertion
         }
     }
 
-     if (generated_count < num_updates) {
+    if (generated_count < num_updates) {
         std::cerr << "Warning: Could only generate " << generated_count << " unique updates after " << attempts << " attempts. The graph might be too dense or too sparse." << std::endl;
     }
 
-
+    // Write updates to output file in lines 'i u v weight' or 'd u v'
     std::cout << "Writing " << generated_updates.size() << " updates to: " << output_updates_file << std::endl;
     std::ofstream outfile(output_updates_file);
     if (!outfile.is_open()) {
@@ -150,7 +147,6 @@ int main(int argc, char* argv[]) {
     outfile << "# Generated updates for graph: " << input_graph_file << std::endl;
     outfile << "# Total updates: " << generated_updates.size() << std::endl;
     for (const auto& change : generated_updates) {
-        // Check change.type instead of change.is_insertion
         if (change.type == ChangeType::INSERT) {
             outfile << "i " << change.u << " " << change.v << " " << change.weight << std::endl;
         } else {

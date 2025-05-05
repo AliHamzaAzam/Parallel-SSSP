@@ -1,20 +1,21 @@
-//
-// Created by Ali Hamza Azam on 25/04/2025.
-//
+// utils.cpp - Implementations of utility functions for graph loading, change parsing, and Dijkstra SSSP
+// ----------------------------------------------------------------------------
 
-#include "../include/utils.hpp"
-#include "../include/graph.hpp"
 #include <fstream>
 #include <sstream>
 #include <iostream>
 #include <vector>
 #include <string>
-#include <tuple> // Required for std::tuple
-#include <algorithm> // Required for std::max
-#include <cstdlib> // Required for exit, EXIT_FAILURE
-#include <stdexcept> // Required for std::runtime_error
+#include <tuple>
+#include <algorithm>
+#include <cstdlib>
+#include <stdexcept>
 
-// Function to load a graph from a file (supports simple edge list and .mtx)
+#include "../include/utils.hpp"
+#include "../include/graph.hpp"
+
+// load_graph: load a Graph from Matrix Market (.mtx) or simple edge list (.edges)
+// Detects format by file extension, parses edges, and constructs adjacency lists.
 Graph load_graph(const std::string& filename) {
     std::ifstream infile(filename);
     if (!infile.is_open()) {
@@ -43,10 +44,10 @@ Graph load_graph(const std::string& filename) {
 
     Graph g(0); // Initialize with 0 vertices, will resize later
     int num_vertices = 0;
-    long long num_edges_expected = 0; // Use long long for potentially large files
     long long edge_count = 0;
 
     if (is_mtx) {
+        long long num_edges_expected = 0;
         std::cout << "Reading Matrix Market file: " << filename << std::endl;
         // --- Read MTX Header --- 
         getline(infile, line); // Read the %%MatrixMarket or %MatrixMarket line
@@ -101,8 +102,7 @@ Graph load_graph(const std::string& filename) {
                  }
 
                  // Optional: Check if anything remains unparsed on the line
-                 std::string remaining;
-                 if (ss_edge >> remaining) {
+                 if (std::string remaining; ss_edge >> remaining) {
                      std::cerr << "Warning: Extra data found on edge line " << line_num << ": '" << remaining << "' in file: " << filename << ". Line: '" << line << "'" << std::endl;
                  }
 
@@ -119,8 +119,6 @@ Graph load_graph(const std::string& filename) {
             } else {
                  // This is where the error occurs
                  std::cerr << "Warning: Skipping malformed edge line " << line_num << " in MTX file: '" << line << "'" << std::endl;
-                 // Add more diagnostics: what is the stream state?
-                 std::cerr << "    Stream state after trying to read u,v: good=" << ss_edge.good() << ", eof=" << ss_edge.eof() << ", fail=" << ss_edge.fail() << ", bad=" << ss_edge.bad() << std::endl;
             }
         }
         if (edge_count != num_edges_expected) {
@@ -188,8 +186,8 @@ Graph load_graph(const std::string& filename) {
     return g;
 }
 
-// Function to load edge changes from a file (format: type u v [weight])
-// type: 'i' for insertion, 'd' for deletion
+// load_edge_changes: parse edge updates file into a list of EdgeChange
+// Supports lines: 'i u v w' for insert and 'd u v' for delete
 std::vector<EdgeChange> load_edge_changes(const std::string& filename) {
     std::ifstream infile(filename);
     if (!infile.is_open()) {
@@ -226,14 +224,15 @@ std::vector<EdgeChange> load_edge_changes(const std::string& filename) {
     return changes;
 }
 
-// Dijkstra SSSP implementation for shared use
+// dijkstra: compute single-source shortest paths using a priority queue
+// Returns distances and parent pointers in SSSPResult
 SSSPResult dijkstra(const Graph& g, int source) {
     int n = g.num_vertices;
     SSSPResult result(n);
     result.dist[source] = 0;
     using P = std::pair<double, int>;
-    std::priority_queue<P, std::vector<P>, std::greater<P>> pq;
-    pq.push({0, source});
+    std::priority_queue<P, std::vector<P>, std::greater<>> pq;
+    pq.emplace(0, source);
     while (!pq.empty()) {
         double d = pq.top().first;
         int u = pq.top().second;
@@ -245,7 +244,7 @@ SSSPResult dijkstra(const Graph& g, int source) {
             if (result.dist[u] + weight < result.dist[v]) {
                 result.dist[v] = result.dist[u] + weight;
                 result.parent[v] = u;
-                pq.push({result.dist[v], v});
+                pq.emplace(result.dist[v], v);
             }
         }
     }

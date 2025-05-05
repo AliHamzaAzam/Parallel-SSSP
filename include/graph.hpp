@@ -1,40 +1,39 @@
-//
-// Created by Ali Hamza Azam on 25/04/2025.
-//
+// graph.hpp - Graph and SSSP data structures, plus edge-update definitions
+// -------------------------------------------------------------
+// Defines Graph (adjacency list), SSSPResult, ChangeType, and EdgeChange.
 
 #ifndef PARALLEL_SSSP_GRAPH_H
 #define PARALLEL_SSSP_GRAPH_H
 
 #include <vector>
 #include <limits>
-#include <queue>
-#include <atomic> // For potential atomic operations if needed later
-#include <stdexcept> // For exceptions
-#include <metis.h> // Include METIS header
+#include <stdexcept>
+#include <metis.h>
 
-// Add Weight type alias
-using Weight = double;
+using Weight = double;                                // Numeric type for edge weights and distances
+static constexpr Weight INFINITY_WEIGHT =             // Value representing 'infinite' distance
+    std::numeric_limits<Weight>::infinity();
 
-const Weight INFINITY_WEIGHT = std::numeric_limits<Weight>::infinity();
-
+// Edge: destination vertex index and associated weight
 struct Edge {
-    int to;
-    Weight weight; // Use Weight type alias
+    int to;                                           // Neighbor vertex index
+    Weight weight;                                    // Weight of the edge
 };
 
+// Graph: weighted undirected graph stored as adjacency lists
 struct Graph {
-    int num_vertices;
-    std::vector<std::vector<Edge>> adj; // Adjacency list
+    int num_vertices;                                 // Number of vertices in the graph
+    std::vector<std::vector<Edge>> adj;               // Adjacency lists: for each u, vector of Edge{to,weight}
 
-    Graph(int n) : num_vertices(n), adj(n) {}
+    Graph(int n = 0): num_vertices(n), adj(n) {}
 
-    // Declare add_edge here
-    void add_edge(int u, int v, Weight weight);
+    // add_edge: insert an undirected edge u<->v with weight w
+    void add_edge(int u, int v, Weight w);
 
-    // Placeholder for removing an edge - requires finding the edge first
+    // remove_edge: remove edge u<->v if present (no-op if missing)
     void remove_edge(int u, int v);
 
-    // Add const overload for neighbors
+    // neighbors: return list of outgoing edges from u
     const std::vector<Edge>& neighbors(int u) const {
          if (u < 0 || u >= num_vertices) {
              throw std::out_of_range("Vertex index out of range in neighbors()");
@@ -42,11 +41,17 @@ struct Graph {
         return adj[u];
     }
 
-    // Method to convert graph to METIS CSR format - Declaration moved here
-    void to_metis_csr(std::vector<idx_t>& xadj, std::vector<idx_t>& adjncy, std::vector<idx_t>& adjwgt) const;
+    // to_metis_csr: populate CSR arrays for METIS_PartGraphKway
+    //   xadj: offsets into adjncy/adjwgt, size num_vertices+1
+    //   adjncy: concatenated target indices
+    //   adjwgt: corresponding edge weights (idx_t)
+    void to_metis_csr(
+        std::vector<idx_t>& xadj,
+        std::vector<idx_t>& adjncy,
+        std::vector<idx_t>& adjwgt) const;
 
     // Method to get the number of unique edges (handles undirected representation)
-    size_t get_edge_count() const {
+    [[nodiscard]] size_t get_edge_count() const {
         size_t count = 0;
         for (int u = 0; u < num_vertices; ++u) {
             for (const auto& edge : adj[u]) {
@@ -60,31 +65,24 @@ struct Graph {
     }
 
     // Check if an edge exists between two vertices
-    bool has_edge(int u, int v) const;
+    [[nodiscard]] bool has_edge(int u, int v) const;
 };
 
-// Structure to hold SSSP results
+// SSSPResult: stores distances and parent pointers for SSSP tree
 struct SSSPResult {
-    std::vector<Weight> dist; // Use Weight type alias
-    std::vector<int> parent;
-
-    // Constructor initializing vectors
-    SSSPResult(int n = 0) : dist(n, INFINITY_WEIGHT), parent(n, -1) {}
+    std::vector<Weight> dist;                         // dist[u] = shortest-path distance from source
+    std::vector<int> parent;                          // parent[u] = predecessor of u in the SSSP tree, or -1
+    SSSPResult(int n = 0): dist(n, INFINITY_WEIGHT), parent(n, -1) {}
 };
 
-// Enum for types of edge changes
-enum class ChangeType {
-    INSERT,
-    DELETE,
-    INCREASE, // Weight increase (treated like DELETE in some contexts)
-    DECREASE  // Weight decrease (treated like INSERT in some contexts)
-};
+// ChangeType: type of structural update to apply to graph
+enum class ChangeType { INSERT, DELETE, INCREASE, DECREASE };
 
-// Structure for edge changes
+// EdgeChange: represent a single update operation on an edge
 struct EdgeChange {
-    int u, v;
-    Weight weight; // Use Weight type alias
-    ChangeType type; // Type of change
+    int u, v;                                         // Endpoints of the edge
+    Weight weight;                                    // New weight for INSERT/DECREASE, ignored for DELETE/INCREASE
+    ChangeType type;                                  // Type of update
 };
 
-#endif //PARALLEL_SSSP_GRAPH_H
+#endif // PARALLEL_SSSP_GRAPH_H

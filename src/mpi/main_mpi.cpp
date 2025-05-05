@@ -1,72 +1,70 @@
+// main_mpi.cpp - Distributed Dynamic SSSP using MPI and OpenMP
+// ------------------------------------------------------------
+// Entry point and orchestration for loading the graph, partitioning,
+// scattering subgraphs, and performing dynamic SSSP updates in parallel.
+// Coordinates MPI communication and collects results back on rank 0.
+
 #include <iostream>
 #include <vector>
 #include <string>
-#include <chrono> // Include for timing
+#include <chrono>
 #include <stdexcept>
-#include <numeric>
 #include <algorithm>
 #include <mpi.h>
 #include <metis.h>
-#include <map> // Needed for boundary edge storage
-#include <sstream> // Needed for printing vectors
+#include <map>
+#include <cstdlib>
+#include <cstring>
 
 #include "../../include/graph.hpp"
 #include "../../include/utils.hpp"
 
-// Forward declaration for the MPI SSSP function
-void SSSP_MPI(const Graph& graph, int source, SSSPResult& result, int argc, char* argv[]);
-// Forward declaration for sequential Dijkstra (needed for baseline/initial compute on rank 0)
-SSSPResult dijkstra(const Graph& g, int source); // Ensure this is declared
-// Forward declaration for distributed Bellman-Ford SSSP (might be removed later)
-void Distributed_BellmanFord_MPI(
-    Graph& local_graph,
-    const std::vector<int>& local_to_global,
-    const std::vector<int>& global_to_local,
-    const std::vector<idx_t>& part,
-    int my_rank,
-    int num_ranks,
-    int global_source,
-    std::vector<double>& global_dist
-);
+// Add a type alias for boundary edges before forward declarations
+using BoundaryEdges = std::map<int,std::vector<Edge>>;
 // Forward declaration for distributed dynamic SSSP update (signature updated)
 void Distributed_DynamicSSSP_MPI(
-    Graph& local_graph,
-    const std::map<int, std::vector<Edge>>& local_boundary_edges, // Input: boundary edges
-    const std::vector<int>& local_to_global,
-    const std::vector<int>& global_to_local,
-    std::vector<double>& dist,         // Local distances (output)
-    std::vector<int>& parent,         // Local parents (output)
-    const std::vector<EdgeChange>& changes, // Full changes list (may not be needed if initial affected is enough)
-    int my_rank,
-    int num_ranks,
-    const std::vector<int>& part,     // Changed idx_t to int
-    int source,
-    const std::vector<bool>& initial_affected_del, // Initial affected_del status for local vertices
-    const std::vector<bool>& initial_affected,      // Initial affected status for local vertices
-    bool debug_output = false      // Added debug_output parameter
+    const Graph& local_graph,                               // Input: local graph structure
+    const BoundaryEdges& local_boundary_edges,              // Input: boundary edges
+    const std::vector<int>& local_to_global,                // Input: local to global mapping
+    const std::vector<int>& global_to_local,                // Input: global to local mapping
+    std::vector<double>& dist,                              // Input/Output: local distances (in/out)
+    std::vector<int>& parent,                               // Input/Output: local parents (in/out)
+    int my_rank,                                            // Input: current MPI rank
+    const std::vector<int>& part,                           // Input: partition assignment for each global vertex
+    int source,                                             // Input: source vertex for SSSP
+    const std::vector<bool>& initial_affected_del,          // Initial affected_del status for local vertices
+    const std::vector<bool>& initial_affected,              // Initial affected status for local vertices
+    bool debug_output = false                               // Input: debug output flag (default: false)
 );
 
-// Add a type alias for clarity
-using BoundaryEdges = std::map<int, std::vector<Edge>>; // local_vertex_idx -> list of edges to global_vertex_idx
-
-// Helper: Extract local subgraph, populate mappings, and handle boundary edges
+// setup_local_data: extract the subgraph owned by this rank
+// - global_graph: full graph on rank 0
+// - part: partition assignment for each global vertex
+// - my_rank: current MPI rank
+// Outputs:
+//   local_graph         : induced subgraph of owned vertices
+//   local_to_global     : map from local indices to global IDs
+//   global_to_local     : inverse map (global ID -> local index or -1)
+//   local_boundary_edges: incoming edges from remote vertices
+//   local_dist, local_parent, local_affected_del, local_affected:
+//                        initial state for dynamic update
 void setup_local_data(
-    const Graph& global_graph,
-    const std::vector<idx_t>& part,
-    int my_rank,
-    Graph& local_graph, // Output: local graph structure
-    std::vector<int>& local_to_global, // Output: mapping local index -> global index
-    std::vector<int>& global_to_local, // Output: mapping global index -> local index (-1 if not local)
-    BoundaryEdges& local_boundary_edges, // Output: boundary edges map (INCOMING edges: local_v -> {global_u, weight})
-    const SSSPResult& initial_sssp_result, // Input: Full initial result (only needed on rank 0)
-    const std::vector<bool>& initial_affected_del_global, // Input: Full initial affected_del (only needed on rank 0)
-    const std::vector<bool>& initial_affected_global, // Input: Full initial affected (only needed on rank 0)
-    std::vector<double>& local_dist, // Output: local distances
-    std::vector<int>& local_parent, // Output: local parents (stores local index if parent is local, global index if remote)
-    std::vector<bool>& local_affected_del, // Output: local affected_del
-    std::vector<bool>& local_affected // Output: local affected
+    const Graph& global_graph,                              // Input: full graph on rank 0
+    const std::vector<idx_t>& part,                         // Input: partition assignment for each global vertex
+    int my_rank,                                            // Input: current MPI rank
+    Graph& local_graph,                                     // Output: local graph structure
+    std::vector<int>& local_to_global,                      // Output: mapping local index -> global index
+    std::vector<int>& global_to_local,                      // Output: mapping global index -> local index (-1 if not local)
+    BoundaryEdges& local_boundary_edges,                    // Output: boundary edges map (INCOMING edges: local_v -> {global_u, weight})
+    const SSSPResult& initial_sssp_result,                  // Input: Full initial result (only needed on rank 0)
+    const std::vector<bool>& initial_affected_del_global,   // Input: Full initial affected_del (only needed on rank 0)
+        const std::vector<bool>& initial_affected_global,   // Input: Full initial affected (only needed on rank 0)
+    std::vector<double>& local_dist,                        // Output: local distances
+    std::vector<int>& local_parent,                         // Output: local parents (stores local index if parent is local, global index if remote)
+    std::vector<bool>& local_affected_del,                  // Output: local affected_del
+    std::vector<bool>& local_affected                       // Output: local affected
 ) {
-    int n_global = global_graph.num_vertices;
+    const int n_global = global_graph.num_vertices;
     std::cout << "[Rank " << my_rank << "] Starting local data setup for " << n_global << " global vertices." << std::endl;
 
     // 1. Identify local vertices and create initial mappings
@@ -74,12 +72,13 @@ void setup_local_data(
     global_to_local.assign(n_global, -1);
     for (int v_global = 0; v_global < n_global; ++v_global) {
         if (part[v_global] == my_rank) {
-            int v_local = local_to_global.size(); // Assign next available local index
+            // Assign next available local index
+            const int v_local = local_to_global.size();
             local_to_global.push_back(v_global);
             global_to_local[v_global] = v_local;
         }
     }
-    int n_local = local_to_global.size();
+    const int n_local = local_to_global.size();
     std::cout << "[Rank " << my_rank << "] Identified " << n_local << " local vertices." << std::endl;
 
     // 2. Initialize local graph and state vectors
@@ -95,7 +94,7 @@ void setup_local_data(
     if (my_rank == 0) {
          std::cout << "[Rank 0] Populating local state from initial SSSP result." << std::endl;
          for (int u_local = 0; u_local < n_local; ++u_local) {
-             int u_global = local_to_global[u_local];
+             const int u_global = local_to_global[u_local];
              // Add bounds check for safety
              if (u_global >= 0 && u_global < initial_sssp_result.dist.size()) {
                  local_dist[u_local] = initial_sssp_result.dist[u_global];
@@ -154,7 +153,7 @@ void setup_local_data(
                 }
                 // else: Destination v_global is remote, ignore this edge for local setup
             }
-        } catch (const std::out_of_range& oor) {
+        } catch ([[maybe_unused]] const std::out_of_range& oor) {
              std::cerr << "[Rank " << my_rank << "] Warning: Out-of-range access for neighbors of global vertex " << u_global << ". Skipping." << std::endl;
         }
     }
@@ -163,6 +162,10 @@ void setup_local_data(
      std::cout << "[Rank " << my_rank << "] Local data setup finished." << std::endl;
 }
 
+// mpi_main: parse arguments, broadcast parameters, load graph,
+// perform initial Dijkstra on rank 0, partition graph, compute initial affected set,
+// distribute subgraphs to worker ranks, invoke Distributed_DynamicSSSP_MPI,
+// and gather and print final results on rank 0.
 int mpi_main(int argc, char* argv[]) {
     MPI_Init(&argc, &argv);
     int rank, size;
@@ -173,8 +176,8 @@ int mpi_main(int argc, char* argv[]) {
     bool debug_output = false;
     // Check for environment variable to enable debug output
     char* debug_env = getenv("SSSP_DEBUG");
-    if (debug_env != nullptr && (strcmp(debug_env, "1") == 0 || 
-                                strcmp(debug_env, "true") == 0 || 
+    if (debug_env != nullptr && (strcmp(debug_env, "1") == 0 ||
+                                strcmp(debug_env, "true") == 0 ||
                                 strcmp(debug_env, "yes") == 0)) {
         debug_output = true;
         if (rank == 0) std::cout << "Debug output enabled via SSSP_DEBUG environment variable" << std::endl;
@@ -182,22 +185,22 @@ int mpi_main(int argc, char* argv[]) {
 
     std::string filename;
     int start_node = -1;
-    std::string changes_filename = "";
+    std::string changes_filename;
     idx_t num_partitions = size;
     Graph graph(0); // Local graph variable
     std::vector<EdgeChange> changes;
     int num_changes = 0;
-    SSSPResult initial_sssp_result(0); // Initialize with size 0 using the constructor
-    std::vector<bool> affected_del; // For Rank 0 initial calculation
-    std::vector<bool> affected;     // For Rank 0 initial calculation
-    std::vector<int> part;         // Partition vector (size known after graph load, use int for MPI_INT)
+    SSSPResult initial_sssp_result(0);        // Initialize with size 0 using the constructor
+    std::vector<bool> affected_del;             // For Rank 0 initial calculation
+    std::vector<bool> affected;                 // For Rank 0 initial calculation
+    std::vector<int> part;                      // Partition vector (size known after graph load, use int for MPI_INT)
 
     // --- Argument Parsing and Broadcasting ---
     if (rank == 0) {
         // ... (Argument parsing logic as before - sets filename, start_node, changes_filename, num_partitions) ...
         if (argc < 2) { std::cerr << "Usage (from main): <graph_file.ext> <start_node> [changes_file] [num_partitions]" << std::endl; MPI_Abort(MPI_COMM_WORLD, 1); }
         filename = argv[0];
-        try { start_node = std::stoi(argv[1]); } catch (const std::exception& e) { std::cerr << "Error: Invalid start node provided: " << argv[1] << std::endl; MPI_Abort(MPI_COMM_WORLD, 1); }
+        try { start_node = std::stoi(argv[1]); } catch ([[maybe_unused]] const std::exception& e) { std::cerr << "Error: Invalid start node provided: " << argv[1] << std::endl; MPI_Abort(MPI_COMM_WORLD, 1); }
         if (argc > 2) changes_filename = argv[2];
         if (argc > 3) { try { num_partitions = std::max((idx_t)1, (idx_t)std::stoi(argv[3])); } catch (const std::exception& e) { std::cerr << "Warning: Invalid number of partitions provided: '" << argv[3] << "'. Using default (" << size << "). Error: " << e.what() << std::endl; num_partitions = size; } }
         else { if (rank == 0) std::cout << "Number of partitions not specified. Defaulting to number of MPI ranks (" << size << ")." << std::endl; num_partitions = size; } // Default if not provided
@@ -265,7 +268,7 @@ int mpi_main(int argc, char* argv[]) {
     }
 
     // --- Rank 0: Initial SSSP, Partitioning, Initial Affected Calc ---
-    std::chrono::duration<double, std::milli> initial_sssp_time_rank0; // Timing variable
+    std::chrono::duration<double, std::milli> initial_sssp_time_rank0{}; // Timing variable
     if (rank == 0) {
         std::cout << "Rank 0: Performing initial SSSP..." << std::endl;
         auto start_initial_sssp = std::chrono::high_resolution_clock::now();
@@ -282,10 +285,10 @@ int mpi_main(int argc, char* argv[]) {
              graph.to_metis_csr(xadj, adjncy, adjwgt);
              idx_t nVertices = graph.num_vertices;
              idx_t ncon = 1;
-             idx_t* adjwgt_ptr = adjwgt.empty() ? NULL : adjwgt.data();
+             idx_t* adjwgt_ptr = adjwgt.empty() ? nullptr : adjwgt.data();
              idx_t nParts = num_partitions;
              if (!adjncy.empty()) {
-                 int metis_ret = METIS_PartGraphKway(&nVertices, &ncon, xadj.data(), adjncy.data(), NULL, NULL, adjwgt_ptr, &nParts, NULL, NULL, NULL, &objval, part.data());
+                 int metis_ret = METIS_PartGraphKway(&nVertices, &ncon, xadj.data(), adjncy.data(), nullptr, nullptr, adjwgt_ptr, &nParts, nullptr, nullptr, nullptr, &objval, part.data());
                  if (metis_ret != METIS_OK) { std::cerr << "METIS partitioning failed (Rank 0). Error code: " << metis_ret << ". Aborting." << std::endl; MPI_Abort(MPI_COMM_WORLD, 1); }
                  else { std::cout << "METIS partitioning successful (Rank 0). Edge cut: " << objval << std::endl; }
              } else { std::cerr << "Warning (Rank 0): Graph has no edges. Assigning vertices sequentially." << std::endl; for(idx_t i = 0; i < nVertices; ++i) part[i] = i % nParts; }
@@ -310,12 +313,10 @@ int mpi_main(int argc, char* argv[]) {
             // Check if edge e(u, v) was in the original SSSP tree T
             // Note: This check assumes an undirected graph representation in the parent array
             // or that the edge direction matches parent relationship.
-            bool in_tree = (temp_sssp_result.parent[change.v] == change.u);
             // If the graph is stored undirected, you might need:
             // bool in_tree = (temp_sssp_result.parent[change.v] == change.u) || (temp_sssp_result.parent[change.u] == change.v);
 
-            if (in_tree) {
-                 int u = change.u;
+            if (temp_sssp_result.parent[change.v] == change.u) {
                  int v = change.v;
                  // y = argmax_{x in {u,v}} {Dist[x]}
                  // We mark the child node 'v' as affected if the edge (u,v) from parent u is deleted/increased.
@@ -324,8 +325,6 @@ int mpi_main(int argc, char* argv[]) {
                      temp_sssp_result.dist[y] = INFINITY_WEIGHT; // Change Dist[y] to infinity in the *temporary* result
                      affected_del[y] = true;
                      affected[y] = true;
-                     // TODO: Potentially propagate INF distance change in temp_sssp_result for accurate affected calculation?
-                     // This might require a temporary BFS/DFS from y in the tree. For now, just mark y.
                  }
             }
         }
@@ -353,8 +352,6 @@ int mpi_main(int argc, char* argv[]) {
              }
         }
          std::cout << "Rank 0: Initial affected calculation done." << std::endl;
-         // Now, 'affected_del' and 'affected' contain the initial status based on the original SSSP tree.
-         // 'initial_sssp_result' still holds the *original* Dijkstra result.
     }
 
     // --- Broadcast Partition Vector ---
@@ -363,14 +360,14 @@ int mpi_main(int argc, char* argv[]) {
     // --- Data Scattering Preparation ---
     Graph local_graph(0); // Initialize on all ranks
     std::vector<int> local_to_global;
-    std::vector<int> global_to_local; // Map for local rank: global_idx -> local_idx (-1 if not local)
+    std::vector<int> global_to_local;   // Map for local rank: global_idx -> local_idx (-1 if not local)
     BoundaryEdges local_boundary_edges; // Add map for boundary edges
     std::vector<double> local_dist;
     std::vector<int> local_parent;
     std::vector<bool> local_affected_del;
     std::vector<bool> local_affected;
 
-    // --- Setup Local Data for Rank 0 --- // MODIFIED SECTION START
+    // --- Setup Local Data (Rank 0) ---
     if (rank == 0) {
         std::cout << "[Rank 0] Starting setup for own local data..." << std::endl;
         setup_local_data(graph, part, rank,
@@ -411,7 +408,6 @@ int mpi_main(int argc, char* argv[]) {
                 dest_local_affected_del[u_local] = affected_del[u_global];
                 dest_local_affected[u_local] = affected[u_global];
             }
-             // Note: Parent conversion to local index will happen on the receiving rank.
 
             // 3. Extract local graph structure AND boundary edges for dest_rank
             std::vector<std::vector<Edge>> adj_list_to_send(dest_n_local);
@@ -436,15 +432,13 @@ int mpi_main(int argc, char* argv[]) {
                             dest_boundary_edges++;
                         }
                     }
-                 } catch (const std::out_of_range& oor) { /* Ignore */ }
+                 } catch ([[maybe_unused]] const std::out_of_range& oor) { /* Ignore */ }
             }
              std::cout << "[Rank 0] Prepared data for Rank " << dest_rank << ". Internal edges: " << dest_internal_edges << ", Boundary edges: " << dest_boundary_edges << std::endl;
 
 
             // 4. Send data (Add sends for boundary edges)
-            // Tags: 0:n_local, 1:local_to_global, 2:dist, 3:parent, 4:aff_del, 5:aff,
-            //       6:adj_list sizes, 7:adj_list data,
-            //       8:boundary map size, 9:boundary map keys, 10:boundary edge counts, 11:boundary edge data
+            // Communication tags for MPI_Send/MPI_Recv
             std::cout << "[Rank 0] Sending data to Rank " << dest_rank << "..." << std::endl;
             MPI_Send(&dest_n_local, 1, MPI_INT, dest_rank, 0, MPI_COMM_WORLD);
             MPI_Send(dest_local_to_global.data(), dest_n_local, MPI_INT, dest_rank, 1, MPI_COMM_WORLD);
@@ -468,16 +462,16 @@ int mpi_main(int argc, char* argv[]) {
             int total_adj_entries = adj_data.size();
             std::vector<int> adj_destinations(total_adj_entries);     // Edge destinations
             std::vector<double> adj_weights(total_adj_entries);       // Edge weights
-            
+
             // Split Edge objects into separate arrays for safer transmission
             for (int i = 0; i < total_adj_entries; i++) {
                 adj_destinations[i] = adj_data[i].to;
                 adj_weights[i] = adj_data[i].weight;
             }
-            
+
             // Send the size first
             MPI_Send(&total_adj_entries, 1, MPI_INT, dest_rank, 7, MPI_COMM_WORLD);
-            
+
             // Only send data if there are edges to send
             if (total_adj_entries > 0) {
                 MPI_Send(adj_destinations.data(), total_adj_entries, MPI_INT, dest_rank, 71, MPI_COMM_WORLD);
@@ -494,31 +488,31 @@ int mpi_main(int argc, char* argv[]) {
                 std::vector<int> boundary_counts;
                 std::vector<int> boundary_destinations;
                 std::vector<double> boundary_weights;
-                
+
                 boundary_keys.reserve(boundary_map_size);
                 boundary_counts.reserve(boundary_map_size);
-                
+
                 // Flatten boundary edges into simple arrays
                 int total_boundary_edges = 0;
                 for(const auto& pair : boundary_edges_to_send) {
                     boundary_keys.push_back(pair.first); // local source index
                     boundary_counts.push_back(pair.second.size());
                     total_boundary_edges += pair.second.size();
-                    
+
                     // Extract destination and weight information
                     for (const auto& edge : pair.second) {
                         boundary_destinations.push_back(edge.to);
                         boundary_weights.push_back(edge.weight);
                     }
                 }
-                
+
                 // Send boundary edge metadata
                 MPI_Send(boundary_keys.data(), boundary_map_size, MPI_INT, dest_rank, 9, MPI_COMM_WORLD);
                 MPI_Send(boundary_counts.data(), boundary_map_size, MPI_INT, dest_rank, 10, MPI_COMM_WORLD);
-                
+
                 // Send the flattened boundary edge data
                 MPI_Send(&total_boundary_edges, 1, MPI_INT, dest_rank, 11, MPI_COMM_WORLD);
-                
+
                 if (total_boundary_edges > 0) {
                     MPI_Send(boundary_destinations.data(), total_boundary_edges, MPI_INT, dest_rank, 111, MPI_COMM_WORLD);
                     MPI_Send(boundary_weights.data(), total_boundary_edges, MPI_DOUBLE, dest_rank, 112, MPI_COMM_WORLD);
@@ -539,8 +533,8 @@ int mpi_main(int argc, char* argv[]) {
 
         // Safety check for n_local value
         if (n_local <= 0 || n_local > graph.num_vertices) {
-            std::cerr << "[Rank " << rank << "] ERROR: Received invalid n_local value: " << n_local 
-                      << ". Expected a value between 1 and " << graph.num_vertices 
+            std::cerr << "[Rank " << rank << "] ERROR: Received invalid n_local value: " << n_local
+                      << ". Expected a value between 1 and " << graph.num_vertices
                       << ". Aborting." << std::endl;
             MPI_Abort(MPI_COMM_WORLD, 1);
             return 1;
@@ -549,12 +543,12 @@ int mpi_main(int argc, char* argv[]) {
         // Resize local vectors with try-catch to handle allocation errors
         try {
             local_to_global.resize(n_local);
-            
+
             // Use vector constructor instead of assign to avoid potential memory issues
             int n_global = graph.num_vertices;
             std::vector<int> new_global_to_local(n_global, -1);
             global_to_local = std::move(new_global_to_local);
-            
+
             local_dist.resize(n_local);
             local_parent.resize(n_local);
             local_affected_del.resize(n_local);
@@ -564,7 +558,7 @@ int mpi_main(int argc, char* argv[]) {
             MPI_Abort(MPI_COMM_WORLD, 1);
             return 1;
         }
-        
+
         std::vector<char> aff_del_char(n_local);
         std::vector<char> aff_char(n_local);
         std::vector<int> adj_sizes(n_local);
@@ -590,19 +584,19 @@ int mpi_main(int argc, char* argv[]) {
 
         // Receive internal adjacency list data (Tags 6, 7)
         MPI_Recv(adj_sizes.data(), n_local, MPI_INT, 0, 6, MPI_COMM_WORLD, &status);
-        
+
         // Receive the size of adjacency data
         int total_adj_entries;
         MPI_Recv(&total_adj_entries, 1, MPI_INT, 0, 7, MPI_COMM_WORLD, &status);
-        
+
         // Receive edge data as separate arrays
         std::vector<int> adj_destinations;
         std::vector<double> adj_weights;
-        
+
         if (total_adj_entries > 0) {
             adj_destinations.resize(total_adj_entries);
             adj_weights.resize(total_adj_entries);
-            
+
             MPI_Recv(adj_destinations.data(), total_adj_entries, MPI_INT, 0, 71, MPI_COMM_WORLD, &status);
             MPI_Recv(adj_weights.data(), total_adj_entries, MPI_DOUBLE, 0, 72, MPI_COMM_WORLD, &status);
         }
@@ -616,18 +610,18 @@ int mpi_main(int argc, char* argv[]) {
                     int dest = adj_destinations[current_adj_idx];
                     double weight = adj_weights[current_adj_idx];
                     current_adj_idx++;
-                    
+
                     // Add sanity check on destination vertex
                     if (dest >= 0 && dest < n_local) {
                         local_graph.add_edge(u_local, dest, weight);
                     } else {
-                        std::cerr << "[Rank " << rank << "] Error: Invalid destination vertex " 
-                                  << dest << " in adjacency list. Valid range is [0, " 
+                        std::cerr << "[Rank " << rank << "] Error: Invalid destination vertex "
+                                  << dest << " in adjacency list. Valid range is [0, "
                                   << (n_local-1) << "]. Skipping." << std::endl;
                     }
                 } else {
                      std::cerr << "[Rank " << rank << "] Error: Mismatch in adjacency list reconstruction. "
-                               << "Tried to access index " << current_adj_idx 
+                               << "Tried to access index " << current_adj_idx
                                << " but array size is " << total_adj_entries << std::endl;
                      break; // Avoid further errors
                 }
@@ -637,18 +631,18 @@ int mpi_main(int argc, char* argv[]) {
         // Receive boundary edges map (Tags 8, 9, 10, 11)
         int boundary_map_size;
         MPI_Recv(&boundary_map_size, 1, MPI_INT, 0, 8, MPI_COMM_WORLD, &status);
-        
+
         // Defensive programming - limit boundary map size to avoid potential buffer overflow
         if (boundary_map_size < 0 || boundary_map_size > n_local) {
-            std::cerr << "[Rank " << rank << "] ERROR: Invalid boundary map size " << boundary_map_size 
+            std::cerr << "[Rank " << rank << "] ERROR: Invalid boundary map size " << boundary_map_size
                       << ". Setting to 0 to avoid segmentation fault." << std::endl;
             boundary_map_size = 0;
         }
-        
+
         if (boundary_map_size > 0) {
             std::vector<int> boundary_keys(boundary_map_size);
             std::vector<int> boundary_counts(boundary_map_size);
-            
+
             // Receive the keys and counts
             MPI_Recv(boundary_keys.data(), boundary_map_size, MPI_INT, 0, 9, MPI_COMM_WORLD, &status);
             MPI_Recv(boundary_counts.data(), boundary_map_size, MPI_INT, 0, 10, MPI_COMM_WORLD, &status);
@@ -656,23 +650,23 @@ int mpi_main(int argc, char* argv[]) {
             // Receive the total number of boundary edges
             int total_boundary_edges;
             MPI_Recv(&total_boundary_edges, 1, MPI_INT, 0, 11, MPI_COMM_WORLD, &status);
-            
+
             // Apply safety checks
             // Additional bounds check on total size
             if (total_boundary_edges < 0 || total_boundary_edges > 1000000) {
-                std::cerr << "[Rank " << rank << "] ERROR: Invalid total boundary edges count " 
+                std::cerr << "[Rank " << rank << "] ERROR: Invalid total boundary edges count "
                           << total_boundary_edges << " (expected range: 0-1000000). Setting to 0." << std::endl;
                 total_boundary_edges = 0;
             }
-            
+
             // Receive the flattened boundary edge data
             std::vector<int> boundary_destinations;
             std::vector<double> boundary_weights;
-            
+
             if (total_boundary_edges > 0) {
                 boundary_destinations.resize(total_boundary_edges);
                 boundary_weights.resize(total_boundary_edges);
-                
+
                 MPI_Recv(boundary_destinations.data(), total_boundary_edges, MPI_INT, 0, 111, MPI_COMM_WORLD, &status);
                 MPI_Recv(boundary_weights.data(), total_boundary_edges, MPI_DOUBLE, 0, 112, MPI_COMM_WORLD, &status);
             }
@@ -683,15 +677,15 @@ int mpi_main(int argc, char* argv[]) {
                 if (boundary_counts[i] >= 0) {
                     expected_sum += boundary_counts[i];
                 } else {
-                    std::cerr << "[Rank " << rank << "] WARNING: Negative boundary count " 
+                    std::cerr << "[Rank " << rank << "] WARNING: Negative boundary count "
                               << boundary_counts[i] << ". Setting to 0." << std::endl;
                     boundary_counts[i] = 0;
                 }
             }
-            
+
             if (expected_sum != total_boundary_edges) {
-                std::cerr << "[Rank " << rank << "] WARNING: Boundary counts sum (" << expected_sum 
-                          << ") doesn't match received total (" << total_boundary_edges 
+                std::cerr << "[Rank " << rank << "] WARNING: Boundary counts sum (" << expected_sum
+                          << ") doesn't match received total (" << total_boundary_edges
                           << "). Using minimum." << std::endl;
                 total_boundary_edges = std::min(expected_sum, total_boundary_edges);
             }
@@ -701,33 +695,33 @@ int mpi_main(int argc, char* argv[]) {
             for (int i = 0; i < boundary_map_size; ++i) {
                 int u_local = boundary_keys[i];
                 int count = boundary_counts[i];
-                
+
                 // Bounds check on local vertex index
                 if (u_local < 0 || u_local >= n_local) {
-                    std::cerr << "[Rank " << rank << "] WARNING: Boundary key " << u_local 
+                    std::cerr << "[Rank " << rank << "] WARNING: Boundary key " << u_local
                               << " is out of bounds [0, " << n_local - 1 << "]. Skipping." << std::endl;
                     current_boundary_idx += count; // Skip these edges
                     continue;
                 }
-                
+
                 std::vector<Edge> edges;
                 edges.reserve(count);
-                
+
                 for (int j = 0; j < count; ++j) {
                     if (current_boundary_idx < total_boundary_edges) {
                         int dest = boundary_destinations[current_boundary_idx];
                         double weight = boundary_weights[current_boundary_idx];
                         current_boundary_idx++;
-                        
+
                         // Store the edge
                         edges.push_back({dest, weight});
                     } else {
-                        std::cerr << "[Rank " << rank << "] Error: Boundary data index " << current_boundary_idx 
+                        std::cerr << "[Rank " << rank << "] Error: Boundary data index " << current_boundary_idx
                                   << " exceeds array size " << total_boundary_edges << std::endl;
                         break;
                     }
                 }
-                
+
                 if (!edges.empty()) {
                     local_boundary_edges[u_local] = std::move(edges);
                 }
@@ -739,7 +733,7 @@ int mpi_main(int argc, char* argv[]) {
 
     MPI_Barrier(MPI_COMM_WORLD); // Wait for all ranks to finish setup/receive
     if (rank == 0) std::cout << "All ranks finished data setup/scattering." << std::endl;
-    // MODIFIED SECTION END
+    // End local data receive/setup section
 
     // --- Distributed Update ---
     if (rank == 0) std::cout << "Starting distributed update phase..." << std::endl;
@@ -753,13 +747,11 @@ int mpi_main(int argc, char* argv[]) {
         global_to_local,        // Mapping: global ID -> local index
         local_dist,          // Local distance array (input/output)
         local_parent,        // Local parent array (input/output)
-        changes,                // Full changes list (might not be needed)
-        rank,
-        size,
+        rank,                   // Current rank
         part,                   // Global partition vector
-        start_node,
+        start_node,             // Starting node for SSSP
         local_affected_del,     // Initial affected_del status for local vertices
-        local_affected,          // Initial affected status for local vertices
+        local_affected,         // Initial affected status for local vertices
         debug_output            // Pass the debug_output flag
     );
 
@@ -773,8 +765,8 @@ int mpi_main(int argc, char* argv[]) {
     std::vector<double> final_global_dist;
     std::vector<int> final_global_parent;
     if (rank == 0) {
-        final_global_dist.resize(n_global, INFINITY_WEIGHT); // Initialize on rank 0
-        final_global_parent.resize(n_global, -1);          // Initialize on rank 0
+        final_global_dist.resize(n_global, INFINITY_WEIGHT);    // Initialize on rank 0
+        final_global_parent.resize(n_global, -1);               // Initialize on rank 0
 
         // Only print debug information when debug_output is enabled
         if (debug_output) {
@@ -815,7 +807,7 @@ int mpi_main(int argc, char* argv[]) {
     std::vector<int> local_parent_out(n_global, -1);
     // Ensure local_to_global is populated before this loop
     if (!local_to_global.empty()) { // Add check to prevent crash if setup is incomplete
-         for (int u_local = 0; u_local < (int)local_to_global.size(); ++u_local) { // Use local_to_global size
+         for (int u_local = 0; u_local < static_cast<int>(local_to_global.size()); ++u_local) { // Use local_to_global size
             int u_global = local_to_global[u_local];
              if (u_global >= 0 && u_global < n_global && u_local < local_parent.size()) { // Bounds check for local_parent too
                 // local_parent[u_local] already stores the GLOBAL parent ID
@@ -841,7 +833,7 @@ int mpi_main(int argc, char* argv[]) {
         if (debug_output) {
             std::cout << "[Rank 0 DEBUG] Partition vector 'part' used for combining: [ ";
             // Need to cast idx_t potentially if printing directly
-            for(size_t i = 0; i < part.size(); ++i) std::cout << static_cast<int>(part[i]) << " ";
+            for(int i : part) std::cout << static_cast<int>(i) << " ";
             std::cout << "]" << std::endl;
         }
 
@@ -885,7 +877,7 @@ int mpi_main(int argc, char* argv[]) {
             else if (i < final_global_dist.size()) std::cout << final_global_dist[i]; // Bounds check
             else std::cout << "ERR"; // Indicate error if out of bounds
             std::cout << ", Parent = ";
-            if (i < final_global_parent.size()) std::cout << final_global_parent[i]; // Bounds check
+            if (i < final_global_parent.size()) std::cout << final_global_parent[i];  // Bounds check
             else std::cout << "ERR"; // Indicate error if out of bounds
             std::cout << std::endl;
         }

@@ -1,85 +1,27 @@
-//
-// Created by Ali Hamza Azam on 25/04/2025.
-//
+// sssp_sequential.cpp - Sequential single-change and batch dynamic SSSP
+// -----------------------------------------------------------------
+// Implements in-place update of SSSPResult for single edge changes or batches
+// using SPFA-like relaxation and tree-invalidation logic.
+
+#include <queue>
+#include <iostream>
 
 #include "../../include/graph.hpp"
-#include "../../include/utils.hpp"
-#include <vector>
-#include <queue>
-#include <limits>
-#include <iostream>
-#include <stdexcept> // For std::runtime_error
 
-// Constants
-#define INF std::numeric_limits<double>::max()
-
-// Baseline Dijkstra Algorithm - REMOVED definition, declared in utils.hpp and defined in utils.cpp
-// SSSPResult dijkstra(const Graph& g, int source) { ... }
-
-
-// Overload for internal use? Check if this is still needed.
-void dijkstra(const Graph& graph, int start_node, SSSPResult& result) {
-    int num_vertices = graph.num_vertices;
-    result.dist.assign(num_vertices, INF);
-    result.parent.assign(num_vertices, -1);
-    result.dist[start_node] = 0;
-
-    // Use Weight (double) for priority queue distance
-    using PDI = std::pair<Weight, int>;
-    std::priority_queue<PDI, std::vector<PDI>, std::greater<PDI>> pq;
-    pq.push({0.0, start_node}); // Use 0.0 for double
-
-    while (!pq.empty()) {
-        Weight d = pq.top().first; // Use Weight
-        int u = pq.top().second;
-        pq.pop();
-
-        // Use INFINITY_WEIGHT for comparison
-        if (d > result.dist[u] && result.dist[u] != INFINITY_WEIGHT) {
-            continue;
-        }
-
-        for (const auto& edge : graph.neighbors(u)) { // Use neighbors() for const correctness
-            int v = edge.to;
-            Weight weight = edge.weight; // Use Weight
-
-            if (result.dist[u] != INFINITY_WEIGHT && result.dist[u] + weight < result.dist[v]) {
-                result.dist[v] = result.dist[u] + weight;
-                result.parent[v] = u;
-                pq.push({result.dist[v], v});
-            }
-        }
-    }
-}
-
-// Helper function for SingleChange (part of Algorithm 1)
-// Propagates updates from a single vertex z
-// Returns true if any neighbor's distance was updated, false otherwise
-// NOTE: This helper is not directly used in the refined SingleChange below.
-// bool UpdatedSSSP(int z, const Graph& G, SSSPResult& T) { ... }
-
-
-// Algorithm 1: Sequential SSSP Update for a Single Change
-// IMPORTANT REFACTOR: This version assumes the graph 'G' ALREADY reflects the change.
-// It needs the 'before' state information (like old weight or parent relationship)
-// passed implicitly or explicitly to correctly handle deletions.
-// The current implementation tries to deduce based on the *current* graph state,
-// which is complex and potentially incorrect after the change is applied.
-// A better approach for sequential updates is often to NOT pre-modify the graph
-// and let SingleChange handle both the graph update and SSSP propagation.
-// ---
-// REVERTING to the logic where SingleChange handles the graph modification itself.
-// This means main.cpp should NOT pre-modify the graph when calling the sequential version.
+// SingleChange: apply one edge insertion or deletion to graph G and update T
+// - change: EdgeChange (type, endpoints, weight)
+// - G: graph to be modified (insert/delete edge)
+// - T: current SSSP result (dist, parent) to be updated incrementally
 void SingleChange(const EdgeChange& change, Graph& G, SSSPResult& T) {
-    int u = change.u;
-    int v = change.v;
-    Weight weight = change.weight; // Weight for insertion
+    const int u = change.u;
+    const int v = change.v;
+    const Weight weight = change.weight; // Weight for insertion
 
     // --- State before the change ---
-    Weight old_dist_u = T.dist[u];
-    Weight old_dist_v = T.dist[v];
-    int old_parent_u = T.parent[u];
-    int old_parent_v = T.parent[v];
+    const Weight old_dist_u = T.dist[u];
+    const Weight old_dist_v = T.dist[v];
+    const int old_parent_u = T.parent[u];
+    const int old_parent_v = T.parent[v];
     Weight existing_weight = INFINITY_WEIGHT; // Weight of edge (u,v) if it exists before change
 
     // Find existing edge weight (needed for deletion logic)
@@ -92,7 +34,7 @@ void SingleChange(const EdgeChange& change, Graph& G, SSSPResult& T) {
                 break;
             }
         }
-    } catch (const std::out_of_range& oor) { /* Ignore if u is invalid */ }
+    } catch ([[maybe_unused]] const std::out_of_range& oor) { /* Ignore if u is invalid */ }
 
 
     // --- Apply the change to the graph structure ---
@@ -143,7 +85,7 @@ void SingleChange(const EdgeChange& change, Graph& G, SSSPResult& T) {
         }
     } else { // Deletion
         // If the deleted edge was part of the SSSP tree for either u or v
-        const double epsilon = 1e-9;
+        constexpr double epsilon = 1e-9;
         bool invalidated = false;
         if (old_parent_v == u && std::abs((old_dist_u + existing_weight) - old_dist_v) < epsilon) {
             // v depended on u via the deleted edge
@@ -228,7 +170,7 @@ void SingleChange(const EdgeChange& change, Graph& G, SSSPResult& T) {
                          }
                      }
                  }
-             } catch (const std::out_of_range& oor) { /* Ignore if z is invalid */ }
+             } catch ([[maybe_unused]] const std::out_of_range& oor) { /* Ignore if z is invalid */ }
 
              if (min_dist_z < T.dist[z]) { // Found a new path to z
                  T.dist[z] = min_dist_z;
@@ -254,19 +196,18 @@ void SingleChange(const EdgeChange& change, Graph& G, SSSPResult& T) {
                          }
                      }
                  }
-             } catch (const std::out_of_range& oor) { /* Ignore if z is invalid */ }
+             } catch ([[maybe_unused]] const std::out_of_range& oor) { /* Ignore if z is invalid */ }
         }
     }
 }
 
-
-// Batch processing function for sequential updates
-// IMPORTANT: Assumes main.cpp does NOT pre-modify the graph for sequential mode.
-// This function calls SingleChange which modifies the graph internally.
+// process_batch_sequential: apply a batch of changes sequentially
+// - g: graph (modified in-place)
+// - sssp_result: SSSPResult to update for all changes
+// - batch: list of EdgeChange
 void process_batch_sequential(Graph& g, SSSPResult& sssp_result, const std::vector<EdgeChange>& batch) {
     std::cout << "Processing batch of " << batch.size() << " changes sequentially (modifying graph internally)..." << std::endl;
     auto start_batch = std::chrono::high_resolution_clock::now();
-    int count = 0;
     for (const auto& change : batch) {
         // std::cout << "  Processing change " << ++count << "/" << batch.size() << "..." << std::endl;
         // Basic validation of change indices before calling SingleChange
