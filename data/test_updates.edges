@@ -1,0 +1,12 @@
+# Generated updates for graph: /Users/azaleas/Developer/CLionProjects/Parallel-sssp/data/test.edges
+# Total updates: 10
+d 5 14
+i 14 13 50.7315
+i 0 3 49.759
+i 12 3 50.9891
+i 4 0 49.3754
+d 5 8
+d 8 10
+d 0 1
+i 13 8 48.0359
+i 4 10 56.8553
