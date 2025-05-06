@@ -67,6 +67,9 @@ int main(int argc, char* argv[]) {
     // Build set and list of current edges in canonical form
     std::set<std::pair<int, int>> existing_edges;
     std::vector<std::pair<int, int>> edge_list; // For selecting random edges to delete
+    // Accumulate current edge weights to compute global mean
+    double sum_weights = 0.0;
+    int edge_count0 = 0;
     edge_list.reserve(graph.get_edge_count()); // Approximate size
 
     for (int u = 0; u < graph.num_vertices; ++u) {
@@ -74,6 +77,8 @@ int main(int argc, char* argv[]) {
             if (u < edge.to) {
                 existing_edges.insert({u, edge.to});
                 edge_list.push_back({u, edge.to});
+                sum_weights += edge.weight;
+                edge_count0++;
             }
         }
     }
@@ -81,11 +86,16 @@ int main(int argc, char* argv[]) {
     if (edge_list.empty() && graph.num_vertices > 0) {
         std::cout << "Warning: Graph has vertices but no edges. Only insertions will be generated." << std::endl;
     }
+    // Compute mean and set weight distribution within ±10% of mean
+    double global_mean = edge_count0 > 0 ? sum_weights / edge_count0 : 1.0;
+    double dev_ratio = 0.1; // 10% deviation allowed
+    double min_weight = std::max(0.0, global_mean * (1.0 - dev_ratio));
+    double max_weight = global_mean * (1.0 + dev_ratio);
 
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<> vertex_dist(0, graph.num_vertices - 1);
-    std::uniform_real_distribution<double> weight_dist(1.0, 100.0); // Example weight range
+    std::uniform_real_distribution<double> weight_dist(min_weight, max_weight); // Centered on global mean ±10%
     std::uniform_real_distribution<> action_dist(0.0, 1.0); // For choosing insert/delete
 
     int generated_count = 0;
@@ -98,11 +108,15 @@ int main(int argc, char* argv[]) {
         bool try_insert = (edge_list.empty() || action_dist(gen) < 0.5); // 50% chance, or always insert if no edges to delete
 
         if (try_insert) {
-            int u = vertex_dist(gen);
-            int v = vertex_dist(gen);
-            if (u == v) continue; // Avoid self-loops
-
-            if (!edge_exists(u, v, existing_edges)) {
+            // Select a pair of distinct vertices without an existing edge
+            int u, v;
+            int attempts_inner = 0;
+            do {
+                if (++attempts_inner > max_attempts) break;
+                u = vertex_dist(gen);
+                v = vertex_dist(gen);
+            } while (u == v || edge_exists(u, v, existing_edges));
+            if (u != v && !edge_exists(u, v, existing_edges)) {
                 double weight = weight_dist(gen);
                 generated_updates.push_back({u, v, weight, ChangeType::INSERT});
                 existing_edges.insert({std::min(u, v), std::max(u, v)});

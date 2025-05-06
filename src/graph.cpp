@@ -3,6 +3,7 @@
 // Defines add_edge, has_edge, remove_edge, and to_metis_csr for Graph.
 
 #include <stdexcept>
+#include <algorithm>
 
 #include "../include/graph.hpp"
 
@@ -32,18 +33,15 @@ void Graph::remove_edge(int u, int v) {
     if (u < 0 || u >= num_vertices || v < 0 || v >= num_vertices) {
         throw std::out_of_range("Vertex index out of range in remove_edge");
     }
-    auto remove = [&](const int from, const int to) {
+    // Remove all undirected edges between u and v to handle possible duplicates
+    auto remove_all = [&](const int from, const int to) {
         auto& neighbors = adj[from];
-        for (auto it = neighbors.begin(); it != neighbors.end(); ++it) {
-            if (it->to == to) {
-                neighbors.erase(it);
-                return true;
-            }
-        }
-        return false;
+        neighbors.erase(std::remove_if(neighbors.begin(), neighbors.end(),
+                                       [&](const auto& e) { return e.to == to; }),
+                        neighbors.end());
     };
-    remove(u, v);
-    remove(v, u);
+    remove_all(u, v);
+    remove_all(v, u);
 }
 
 // to_metis_csr: convert adjacency lists into CSR format for METIS partitioning

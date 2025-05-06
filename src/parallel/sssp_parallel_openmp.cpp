@@ -16,8 +16,10 @@ inline bool is_edge_in_tree(int u, int v,
     const std::vector<Weight>& Dist,
     Weight weight)
 {
-    const double eps = 1e-9;
+    const double eps = 1e-9; // A small epsilon for floating-point comparisons
+    // Check if u is parent of v AND the distance matches
     if (Parent[v] == u && std::abs(Dist[u] + weight - Dist[v]) < eps) return true;
+    // Check if v is parent of u AND the distance matches (for undirected graphs)
     if (Parent[u] == v && std::abs(Dist[v] + weight - Dist[u]) < eps) return true;
     return false;
 }
@@ -69,20 +71,22 @@ void ProcessChanges_OpenMP(
                 }
             }
         } else {
-            // Handle delete or increase: invalidate if tree edge removed
-            Weight dw = INFINITY_WEIGHT;
-            for (auto& e : G.neighbors(u)) if (e.to == v) { dw = e.weight; break; }
-            if (dw == INFINITY_WEIGHT) continue;
-            if (is_edge_in_tree(u, v, T.parent, T.dist, dw)) {
-                int y = (T.parent[v] == u ? v : u);
-                #pragma omp critical
-                {
-                    if (is_edge_in_tree(u, v, T.parent, T.dist, dw) && T.dist[y] != INFINITY_WEIGHT) {
-                        T.dist[y] = INFINITY_WEIGHT;
-                        T.parent[y] = -1;
-                        Affected_Del[y].store(true, std::memory_order_relaxed);
-                        Affected[y].store(true, std::memory_order_relaxed);
-                    }
+            // Handle delete or increase: invalidate tree edge if present (use parent pointers)
+            int y = -1;
+            if (T.parent[v] == u) {
+                y = v;
+            } else if (T.parent[u] == v) {
+                y = u;
+            } else {
+                continue; // not part of tree
+            }
+            #pragma omp critical
+            {
+                if (T.dist[y] != INFINITY_WEIGHT) {
+                    T.dist[y] = INFINITY_WEIGHT;
+                    T.parent[y] = -1;
+                    Affected_Del[y].store(true, std::memory_order_relaxed);
+                    Affected[y].store(true, std::memory_order_relaxed);
                 }
             }
         }
@@ -129,50 +133,84 @@ void UpdateAffectedVertices_OpenMP(
 void AsyncUpdateAffectedVertices_OpenMP(
     const Graph& G,
     SSSPResult& T,
-    std::vector<std::atomic<bool>>& Affected)
+    std::vector<std::atomic<bool>>& Affected) // Affected[v] is true if v needs processing
 {
     #pragma omp parallel
     {
         #pragma omp single nowait
         {
-            // Spawn initial tasks for affected vertices
-            for (int v = 0; v < G.num_vertices; ++v) {
-                if (Affected[v].load(std::memory_order_relaxed)) {
-                    Affected[v].store(false, std::memory_order_relaxed);
-                    #pragma omp task firstprivate(v)
+            for (int v_idx = 0; v_idx < G.num_vertices; ++v_idx) {
+                if (Affected[v_idx].load(std::memory_order_relaxed)) {
+                    #pragma omp task firstprivate(v_idx) shared(G, T, Affected)
                     {
-                        // Process vertex v and propagate relaxations
-                        std::vector<int> stack = {v};
-                        while (!stack.empty()) {
-                            int curr = stack.back();
-                            stack.pop_back();
-                            for (const auto& e : G.neighbors(curr)) {
-                                int u = e.to;
-                                Weight newd = T.dist[curr] + e.weight;
-                                double oldd;
-                                #pragma omp atomic read
-                                oldd = T.dist[u];
-                                if (newd < oldd) {
-                                    #pragma omp atomic write
-                                    T.dist[u] = newd;
-                                    #pragma omp atomic write
-                                    T.parent[u] = curr;
-                                    // Schedule propagation for u if not already scheduled
-                                    if (!Affected[u].exchange(true, std::memory_order_relaxed)) {
-                                        #pragma omp task firstprivate(u)
-                                        {
-                                            stack.push_back(u);
+                        std::vector<int> task_local_stack;
+                        task_local_stack.push_back(v_idx);
+
+                        while (!task_local_stack.empty()) {
+                            int curr = task_local_stack.back();
+                            task_local_stack.pop_back();
+
+                            Affected[curr].store(false, std::memory_order_relaxed);
+
+                            // Step 1: Try to relax 'curr' itself using its neighbors (pull update for curr)
+                            Weight best_dist_for_curr_candidate = T.dist[curr]; 
+                            int best_parent_for_curr_candidate = T.parent[curr];
+                            bool curr_path_can_be_improved = false;
+
+                            for (const auto& edge_to_curr : G.neighbors(curr)) {
+                                int potential_parent = edge_to_curr.to;
+                                Weight weight_pp_to_curr = edge_to_curr.weight;
+
+                                if (T.dist[potential_parent] != INFINITY_WEIGHT) {
+                                    if (T.dist[potential_parent] + weight_pp_to_curr < best_dist_for_curr_candidate) {
+                                        best_dist_for_curr_candidate = T.dist[potential_parent] + weight_pp_to_curr;
+                                        best_parent_for_curr_candidate = potential_parent;
+                                        curr_path_can_be_improved = true;
+                                    }
+                                }
+                            }
+
+                            if (curr_path_can_be_improved) {
+                                #pragma omp critical (sssp_node_update_lock)
+                                {
+                                    if (best_dist_for_curr_candidate < T.dist[curr]) {
+                                        T.dist[curr] = best_dist_for_curr_candidate;
+                                        T.parent[curr] = best_parent_for_curr_candidate;
+                                        // curr_was_actually_updated_in_pull = true; // Not strictly needed for current logic flow
+                                    }
+                                }
+                            }
+
+                            // Step 2: If 'curr' now has a finite distance, try to relax its neighbors (push update from curr)
+                            if (T.dist[curr] != INFINITY_WEIGHT) {
+                                for (const auto& edge_from_curr : G.neighbors(curr)) {
+                                    int u_neighbor = edge_from_curr.to;
+                                    Weight new_dist_for_u_neighbor = T.dist[curr] + edge_from_curr.weight;
+                                    bool neighbor_dist_was_updated = false;
+
+                                    #pragma omp critical (sssp_node_update_lock)
+                                    {
+                                        if (new_dist_for_u_neighbor < T.dist[u_neighbor]) {
+                                            T.dist[u_neighbor] = new_dist_for_u_neighbor;
+                                            T.parent[u_neighbor] = curr;
+                                            neighbor_dist_was_updated = true;
+                                        }
+                                    }
+
+                                    if (neighbor_dist_was_updated) {
+                                        if (!Affected[u_neighbor].exchange(true, std::memory_order_relaxed)) {
+                                            task_local_stack.push_back(u_neighbor);
                                         }
                                     }
                                 }
                             }
-                        }
-                    }
+                        } // end while (!task_local_stack.empty())
+                    } // end task for v_idx
                 }
             }
-        #pragma omp taskwait
-        }
-    }
+            #pragma omp taskwait
+        } // end single
+    } // end parallel
 }
 
 // Asynchronous batch update: apply structural changes then async dynamic update
@@ -188,7 +226,34 @@ void AsyncBatchUpdate_OpenMP(
         Affected[i].store(false, std::memory_order_relaxed);
         Affected_Del[i].store(false, std::memory_order_relaxed);
     }
+
+    // Phase 1: Apply changes to T based on the edge changes and mark directly affected nodes.
     ProcessChanges_OpenMP(G, changes, T, Affected_Del, Affected);
+
+    // Phase 2: Iteratively propagate invalidations (INFINITY_WEIGHT) down the SSSP tree.
+    // This ensures that if a parent's distance becomes INF, its children also become INF
+    // and are marked Affected, forcing them to find new paths.
+    // This loop should be executed single-threaded or with proper synchronization if parallelized.
+    // For simplicity here, it's a sequential loop before the parallel async update.
+    bool changed_invalidation_pass;
+    do {
+        changed_invalidation_pass = false;
+        for (int k = 0; k < n; ++k) {
+            if (T.dist[k] != INFINITY_WEIGHT) { // If k itself is not already INF
+                int parent_of_k = T.parent[k];
+                if (parent_of_k != -1) { // If k has a parent
+                    if (T.dist[parent_of_k] == INFINITY_WEIGHT) { // And parent's distance is INF
+                        T.dist[k] = INFINITY_WEIGHT;
+                        T.parent[k] = -1; // Orphan k
+                        Affected[k].store(true, std::memory_order_relaxed);
+                        changed_invalidation_pass = true;
+                    }
+                }
+            }
+        }
+    } while (changed_invalidation_pass);
+
+    // Phase 3: Asynchronous relaxation for all Affected nodes to find new shortest paths.
     AsyncUpdateAffectedVertices_OpenMP(G, T, Affected);
 }
 

@@ -237,56 +237,48 @@ int serial_main(int argc, char* argv[]) {
         // }
 
 
-        // Apply changes if loaded
-        if (has_changes) {
-             // Apply changes to the graph structure G itself *before* calling update algorithms
-             std::cout << "Applying structural changes to graph..." << std::endl;
-             auto apply_start = std::chrono::high_resolution_clock::now();
-             int skipped_changes = 0;
-             for (const auto& change : changes) {
-                 try {
-                     // Validate indices before applying change
-                     if (change.u < 0 || change.u >= graph.num_vertices || change.v < 0 || change.v >= graph.num_vertices) {
-                         std::cerr << "Warning: Skipping change due to out-of-bounds vertex index: "
-                                   << (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE ? "i/d " : "d/i ")
-                                   << change.u << " " << change.v << std::endl;
-                         skipped_changes++;
-                         continue;
-                     }
+        // Pre-apply structural changes only in baseline mode; sequential dynamic updates will apply inside process_batch_sequential
+        if (has_changes && mode == "baseline") {
+            // Apply changes to the graph structure G itself before baseline recompute
+            std::cout << "Applying structural changes (baseline) to graph..." << std::endl;
+            auto apply_start = std::chrono::high_resolution_clock::now();
+            int skipped_changes = 0;
+            for (const auto& change : changes) {
+                try {
+                    // Validate indices before applying change
+                    if (change.u < 0 || change.u >= graph.num_vertices || change.v < 0 || change.v >= graph.num_vertices) {
+                        std::cerr << "Warning: Skipping change due to out-of-bounds vertex index: "
+                                  << (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE ? "i/d " : "d/i ")
+                                  << change.u << " " << change.v << std::endl;
+                        skipped_changes++;
+                        continue;
+                    }
 
-                     if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) {
-                         graph.add_edge(change.u, change.v, change.weight);
-                     } else {
-                         // std::cout << "Calling remove_edge for (" << change.u << ", " << change.v << ")" << std::endl; // Debug
-                         graph.remove_edge(change.u, change.v); // remove_edge should handle non-existent edges gracefully
-                     }
-                 } catch (const std::exception& e) { // Catch potential errors during modification
-                      std::cerr << "Warning: Error applying change ("
-                                << (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE ? "insert/decrease" : "delete/increase") << " " << change.u << " " << change.v
-                                << "). Skipping change. Error: " << e.what() << std::endl;
-                      skipped_changes++;
-                 }
-             }
-             auto apply_end = std::chrono::high_resolution_clock::now();
-             std::chrono::duration<double, std::milli> apply_time = apply_end - apply_start;
-             std::cout << "Structural changes applied in " << apply_time.count() << " ms.";
-             if (skipped_changes > 0) {
-                 std::cout << " (" << skipped_changes << " changes skipped due to errors or invalid indices)";
-             }
-             std::cout << std::endl;
-
-             // std::cout << "\n--- After Applying Changes (Graph Structure) ---" << std::endl; // Debug
-             // print_sssp_result(sssp_result); // SSSP result not updated yet
-
-             // Debug: Verify edge removal if specific edge was deleted
-             // Example: if edge (0,1) was in changes as deletion:
-             // std::cout << "Edge (0, 1) removed check: " << !graph.has_edge(0, 1) << std::endl;
-
+                    if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) {
+                        graph.add_edge(change.u, change.v, change.weight);
+                    } else {
+                        graph.remove_edge(change.u, change.v);
+                    }
+                } catch (const std::exception& e) { // Catch potential errors during modification
+                     std::cerr << "Warning: Error applying change ("
+                               << (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE ? "insert/decrease" : "delete/increase") << " " << change.u << " " << change.v
+                               << "). Skipping change. Error: " << e.what() << std::endl;
+                     skipped_changes++;
+                }
+            }
+            auto apply_end = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double, std::milli> apply_time = apply_end - apply_start;
+            std::cout << "Structural changes applied in " << apply_time.count() << " ms.";
+            if (skipped_changes > 0) {
+                std::cout << " (" << skipped_changes << " changes skipped due to errors or invalid indices)";
+            }
+            std::cout << std::endl;
+        } else if (has_changes && mode == "sequential") {
+            std::cout << "Skipping pre-application of structural changes (sequential mode); will apply during dynamic update." << std::endl;
         } else if (mode != "baseline") {
-             std::cout << "\nMode '" << mode << "' selected, but no changes file provided/loaded. Only initial SSSP was computed." << std::endl;
-             mode = "baseline"; // Treat as baseline if no changes for update modes
+            std::cout << "\nMode '" << mode << "' selected, but no changes file provided or loaded. Only initial SSSP was computed." << std::endl;
         } else {
-             std::cout << "\nNo changes file provided (or baseline mode selected)." << std::endl;
+            std::cout << "\nNo changes file provided (or baseline mode selected)." << std::endl;
         }
 
         // Validate mode string *after* potential modification above
@@ -303,12 +295,20 @@ int serial_main(int argc, char* argv[]) {
 
         if (mode == "sequential") {
             if (has_changes) {
-                 std::cout << "Processing batch sequentially..." << std::endl;
-                 // Ensure process_batch_sequential works correctly with the modified graph
-                 process_batch_sequential(graph, sssp_result, changes);
-                 update_performed = true;
+                std::cout << "Applying all changes (sequential baseline update)..." << std::endl;
+                // apply each change directly to the graph
+                for (const auto& change : changes) {
+                    if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) {
+                        graph.add_edge(change.u, change.v, change.weight);
+                    } else {
+                        graph.remove_edge(change.u, change.v);
+                    }
+                }
+                // recompute full SSSP
+                sssp_result = dijkstra(graph, start_node);
+                update_performed = true;
             } else {
-                 std::cout << "Sequential mode selected, but no changes file provided/loaded. Skipping update." << std::endl;
+                std::cout << "Sequential mode selected, but no changes file provided/loaded. Skipping update." << std::endl;
             }
         } else if (mode == "openmp") {
              if (has_changes) {

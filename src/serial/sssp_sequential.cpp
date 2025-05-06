@@ -84,68 +84,40 @@ void SingleChange(const EdgeChange& change, Graph& G, SSSPResult& T) {
             add_to_queue(u);
         }
     } else { // Deletion
-        // If the deleted edge was part of the SSSP tree for either u or v
-        constexpr double epsilon = 1e-9;
+        // Invalidate the removed edge if it was a tree edge
         bool invalidated = false;
-        if (old_parent_v == u && std::abs((old_dist_u + existing_weight) - old_dist_v) < epsilon) {
-            // v depended on u via the deleted edge
+        std::queue<int> children_q;
+        // Check v->u relation
+        if (T.parent[v] == u) {
             T.dist[v] = INFINITY_WEIGHT;
             T.parent[v] = -1;
             add_to_queue(v);
             invalidated = true;
-            // Need to invalidate children of v as well
-            std::queue<int> children_q;
             children_q.push(v);
-            while(!children_q.empty()){
-                int curr = children_q.front();
-                children_q.pop();
-                // Inefficiently find children
-                 for(int i=0; i<G.num_vertices; ++i){
-                     if(T.parent[i] == curr){
-                         if(T.dist[i] != INFINITY_WEIGHT){
-                             T.dist[i] = INFINITY_WEIGHT;
-                             T.parent[i] = -1;
-                             add_to_queue(i); // Add invalidated child to main queue
-                             children_q.push(i); // Add to explore its children
-                         }
-                     }
-                 }
-            }
-
+        } else if (T.parent[u] == v) {
+            T.dist[u] = INFINITY_WEIGHT;
+            T.parent[u] = -1;
+            add_to_queue(u);
+            invalidated = true;
+            children_q.push(u);
         }
-        // Symmetrically check if u depended on v
-        if (old_parent_u == v && std::abs((old_dist_v + existing_weight) - old_dist_u) < epsilon) {
-             // u depended on v via the deleted edge
-            if (T.dist[u] != INFINITY_WEIGHT) { // Avoid double invalidation if symmetric check runs
-                T.dist[u] = INFINITY_WEIGHT;
-                T.parent[u] = -1;
-                add_to_queue(u);
-                invalidated = true;
-                 // Invalidate children of u
-                std::queue<int> children_q;
-                children_q.push(u);
-                while(!children_q.empty()){
-                    int curr = children_q.front();
-                    children_q.pop();
-                     for(int i=0; i<G.num_vertices; ++i){
-                         if(T.parent[i] == curr){
-                             if(T.dist[i] != INFINITY_WEIGHT){
-                                 T.dist[i] = INFINITY_WEIGHT;
-                                 T.parent[i] = -1;
-                                 add_to_queue(i);
-                                 children_q.push(i);
-                             }
-                         }
-                     }
+        // Invalidate all descendants of the removed tree edge
+        while (!children_q.empty()) {
+            int curr = children_q.front();
+            children_q.pop();
+            for (int i = 0; i < G.num_vertices; ++i) {
+                if (T.parent[i] == curr) {
+                    T.dist[i] = INFINITY_WEIGHT;
+                    T.parent[i] = -1;
+                    add_to_queue(i);
+                    children_q.push(i);
                 }
             }
         }
-
-        // If not part of the tree, deletion might still enable alternative paths for u or v
-        // Add u and v to the queue to re-evaluate their paths just in case
+        // If edge not in tree, enqueue endpoints for potential new paths
         if (!invalidated) {
-             add_to_queue(u);
-             add_to_queue(v);
+            add_to_queue(u);
+            add_to_queue(v);
         }
     }
 
@@ -222,4 +194,3 @@ void process_batch_sequential(Graph& g, SSSPResult& sssp_result, const std::vect
     std::chrono::duration<double, std::milli> batch_time = end_batch - start_batch;
      std::cout << "Sequential batch processing finished in " << batch_time.count() << " ms." << std::endl;
 }
-

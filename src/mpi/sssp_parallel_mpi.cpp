@@ -39,14 +39,22 @@ void Distributed_IdentifyAffected_MPI(
 ) {
     int n_local = local_graph.num_vertices;
     int n_global = part.size();
-    // Step 1: Mark directly affected vertices locally
+    // Step 1: Mark directly affected (deleted/increased) child vertices in the SSSP tree
     std::vector<bool> affected_global(n_global, false);
-    #pragma omp parallel for schedule(static)
     for (const auto& change : changes) {
-        if (change.type == ChangeType::DELETE || change.type == ChangeType::INCREASE) { // Deletion or weight increase
-            int u = change.u, v = change.v;
-            if (u >= 0 && u < n_global) affected_global[u] = true;
-            if (v >= 0 && v < n_global) affected_global[v] = true;
+        if (change.type == ChangeType::DELETE || change.type == ChangeType::INCREASE) {
+            int u = change.u;
+            int v = change.v;
+            int y = -1;
+            // Identify which endpoint was the child in the SSSP tree
+            if (v >= 0 && v < n_global && parent[v] == u) {
+                y = v;
+            } else if (u >= 0 && u < n_global && parent[u] == v) {
+                y = u;
+            }
+            if (y != -1) {
+                affected_global[y] = true;
+            }
         }
     }
     // Step 2: Propagate affected status to descendants in the SSSP tree (global)
@@ -76,6 +84,7 @@ void Distributed_UpdateAffected_MPI_Async(
     std::vector<int>& parent,
     int my_rank,
     const std::vector<int>& part,
+    int source_global_id, // Added source_global_id
     bool debug_output
 );
 
@@ -86,6 +95,7 @@ void Distributed_UpdateAffected_MPI_Async(
 //   local_to_global       : map from local index to global ID
 //   dist, parent          : local SSSP arrays (updated in-place)
 //   my_rank, part         : MPI rank and global partition mapping
+//   source_global_id      : global ID of the SSSP source vertex
 //   debug_output          : enable verbose iteration logs
 // Executes allreduce of global distances and local relaxations until convergence
 void Distributed_UpdateAffected_MPI(
@@ -96,6 +106,7 @@ void Distributed_UpdateAffected_MPI(
     std::vector<int>& parent,
     int my_rank,
     const std::vector<int>& part,
+    int source_global_id, // Added source_global_id
     bool debug_output
 ) {
     int n_local = local_graph.num_vertices;
@@ -135,7 +146,7 @@ void Distributed_UpdateAffected_MPI(
         (strcmp(async_env, "1") == 0 || strcmp(async_env, "true") == 0 || strcmp(async_env, "yes") == 0)) {
         if (my_rank == 0) std::cout << "[Rank 0] Using asynchronous update variant (Algorithm 4)" << std::endl;
         Distributed_UpdateAffected_MPI_Async(local_graph, local_boundary_edges, local_to_global,
-                                            dist, parent, my_rank, part, debug_output);
+                                            dist, parent, my_rank, part, source_global_id, debug_output); // Pass source_global_id
         return;
     }
 
@@ -177,6 +188,30 @@ void Distributed_UpdateAffected_MPI(
             std::cerr << "[Rank " << my_rank << "] MPI_Allreduce failed. Aborting." << std::endl;
             MPI_Abort(MPI_COMM_WORLD, mpi_result);
             return;
+        }
+
+        // Self-Invalidation Pass based on parent's new distance
+        bool changed_by_self_invalidation = false;
+        for (int u_local = 0; u_local < n_local; ++u_local) {
+            int p_global = parent[u_local]; // Current parent (global ID)
+            if (p_global != -1 && p_global >= 0 && p_global < n_global) { // Valid parent
+                if (current_global_dist[p_global] == INFINITY_WEIGHT) { // Parent became INF
+                    if (dist[u_local] != INFINITY_WEIGHT) {
+                        dist[u_local] = INFINITY_WEIGHT;
+                        parent[u_local] = -1;
+                        changed_by_self_invalidation = true;
+                        if (debug_output) {
+                            int u_g = local_to_global[u_local];
+                            std::cout << "[Rank " << my_rank << " Sync Self-Invalidate] Iter " << iteration
+                                      << ": u_local=" << u_local << " (global " << u_g
+                                      << ") parent " << p_global << " became INF. Dist now INF." << std::endl;
+                        }
+                    }
+                }
+            }
+        }
+        if (changed_by_self_invalidation) {
+            local_changed_in_iter = true;
         }
 
         // --- Local Relaxation Step --- //
@@ -265,6 +300,7 @@ void Distributed_UpdateAffected_MPI_Async(
     std::vector<int>& parent,
     int my_rank,
     const std::vector<int>& part,
+    int source_global_id, // Added source_global_id
     bool debug_output
 ) {
     int n_local = local_graph.num_vertices;
@@ -326,6 +362,58 @@ void Distributed_UpdateAffected_MPI_Async(
             }
         }
 
+        // Self-Invalidation Pass based on parent's new distance (using fresh global_buf)
+        bool changed_by_async_self_invalidation = false;
+        for (int u_local = 0; u_local < n_local; ++u_local) {
+            int p_global = parent[u_local]; // Current parent (global ID)
+            if (p_global != -1 && p_global >= 0 && p_global < n_global) { // Valid parent
+                if (global_buf[p_global] == INFINITY_WEIGHT) { // Parent became INF
+                    if (dist[u_local] != INFINITY_WEIGHT) {
+                        dist[u_local] = INFINITY_WEIGHT;
+                        parent[u_local] = -1;
+                        changed_by_async_self_invalidation = true;
+                        if (debug_output) {
+                            int u_g = local_to_global[u_local];
+                            std::cout << "[Rank " << my_rank << " Async Self-Invalidate] Iter " << iteration
+                                      << ": u_local=" << u_local << " (global " << u_g
+                                      << ") parent " << p_global << " became INF. Dist now INF." << std::endl;
+                        }
+                    }
+                }
+            }
+        }
+        if (changed_by_async_self_invalidation) {
+            local_changed = true;
+        }
+        
+        // Update local dist with fresh global_buf values if they are better (e.g. source or path from another rank)
+        // This step is crucial for incorporating the globally agreed minimums.
+        bool changed_by_global_min_update = false;
+        for (int u_local = 0; u_local < n_local; ++u_local) {
+            int u_global = local_to_global[u_local];
+            if (u_global >= 0 && u_global < n_global) { // Bounds check for u_global
+                 double gd = global_buf[u_global];
+                 if (gd < dist[u_local]) {
+                    dist[u_local] = gd;
+                    // If this node is the source and its distance became 0, parent is -1.
+                    // Otherwise, if we take a global minimum, the parent is not immediately known from this step alone.
+                    // Setting parent to -1 forces relaxation to find the true parent unless it's the source.
+                    parent[u_local] = (u_global == source_global_id && gd == 0.0) ? -1 : -2; // -2 to indicate unknown, to be fixed by relaxation
+                    changed_by_global_min_update = true;
+                 } else if (u_global == source_global_id && dist[u_local] > 0.0 && global_buf[u_global] == 0.0) {
+                    // Ensure source node is correctly set if global_buf confirms its distance is 0
+                    dist[u_local] = 0.0;
+                    parent[u_local] = -1;
+                    changed_by_global_min_update = true;
+                 }
+            }
+        }
+        if (changed_by_global_min_update) local_changed = true;
+
+        // An additional full relaxation pass using the fresh global_buf might be beneficial here
+        // to correctly establish parents after the global_min_update and self-invalidation.
+        // For now, relying on the next iteration's stale relax + current iteration's self-invalidate & global_min.
+
         // convergence check across ranks
         int flag = local_changed ? 1 : 0;
         int global_flag = 0;
@@ -357,55 +445,90 @@ void Distributed_DynamicSSSP_MPI(
     std::vector<int>& parent,
     int my_rank,
     const std::vector<int>& part,
-    int source,
+    int source, // This is the source_global_id
     const std::vector<bool>& initial_affected_del,
     const std::vector<bool>& initial_affected,
     bool debug_output
 ) {
-    const int n_local = local_graph.num_vertices;
-
-    // Use initial_affected instead of recalculating from scratch
-    std::vector<bool> affected = initial_affected;
-
-    // Invalidate affected vertices and descendants
-    std::cout << "[Rank " << my_rank << "] Invalidating locally affected vertices..." << std::endl;
-    int invalidated_count = 0;
-    for (int u_local = 0; u_local < n_local; ++u_local) {
-        // Use initial_affected_del to decide which vertices to fully invalidate
-        if (u_local < initial_affected_del.size() && initial_affected_del[u_local]) {
-            dist[u_local] = INFINITY_WEIGHT;
-            parent[u_local] = -1;
-            if (u_local < affected.size()) affected[u_local] = true; // Ensure marked for update
-            invalidated_count++;
-        }
-        // Ensure vertices only in initial_affected are also marked
-        else if (u_local < initial_affected.size() && initial_affected[u_local]) {
-            if (u_local < affected.size()) affected[u_local] = true;
-        }
+    if (debug_output && my_rank == 0) {
+        std::cout << "[Rank 0 DEBUG] Entering Distributed_DynamicSSSP_MPI. Source: " << source << std::endl;
     }
-    std::cout << "[Rank " << my_rank << "] Invalidated " << invalidated_count << " vertices based on initial_affected_del." << std::endl;
+    int n_local = local_graph.num_vertices;
 
-    // Re-initialize the source node if it is local
-    if (source >= 0 && source < static_cast<int>(global_to_local.size()) && global_to_local[source] != -1) {
-        if (const int src_local = global_to_local[source]; src_local >= 0 && src_local < n_local) { // Bounds check
-            dist[src_local] = 0.0;
-            parent[src_local] = -1; // Source has no parent
-            if (src_local < affected.size()) affected[src_local] = true; // Source might need to propagate updates
-            std::cout << "[Rank " << my_rank << "] Re-initialized local source vertex " << src_local << " (global " << source << ")." << std::endl;
+    // Step 1: Initial invalidation based on initial_affected_del flags.
+    // These flags indicate that the SSSP parent edge for this vertex was deleted or its weight increased significantly.
+    for (int v_local = 0; v_local < n_local; ++v_local) {
+        if (initial_affected_del[v_local]) {
+            if (debug_output) {
+                std::cout << "[Rank " << my_rank << " DEBUG] Initial invalidation for local vertex " << v_local
+                          << " (global " << local_to_global[v_local] << "). Old dist: " << dist[v_local] 
+                          << ", Old parent: " << parent[v_local] << std::endl;
+            }
+            dist[v_local] = INFINITY_WEIGHT;
+            parent[v_local] = -1; 
         }
     }
 
-    // Update affected vertices (full reconnection)
-    Distributed_UpdateAffected_MPI(
-        local_graph,                // Input: local graph structure
-        local_boundary_edges,       // Input: boundary edges map
-        local_to_global,            // Input: mapping local index -> global ID
-        dist,                    // Input/Output: local distances (in/out)
-        parent,                  // Input/Output: local parents (in/out)
-        my_rank,                    // Current MPI rank
-        part,                       // Global partition vector
-        debug_output                // Pass debug_output parameter to control verbose output
+    // Step 2: Propagate invalidations down the *local* SSSP tree.
+    // If a vertex u_local was just invalidated (or was already INF), and it was the parent
+    // of another local vertex v_local_child, then v_local_child must also be invalidated.
+    bool changed_in_local_invalidation_sweep = true;
+    int invalidation_passes = 0;
+    while (changed_in_local_invalidation_sweep) {
+        changed_in_local_invalidation_sweep = false;
+        invalidation_passes++;
+        for (int u_local = 0; u_local < n_local; ++u_local) {
+            if (dist[u_local] == INFINITY_WEIGHT) { // If u_local is invalidated
+                int u_global = local_to_global[u_local]; // Get its global ID
+                // Check all other local vertices to see if u_global was their parent
+                for (int v_local_child = 0; v_local_child < n_local; ++v_local_child) {
+                    // If u_global was parent of v_local_child and v_local_child is not yet invalidated
+                    if (parent[v_local_child] == u_global && dist[v_local_child] != INFINITY_WEIGHT) {
+                        if (debug_output) {
+                             std::cout << "[Rank " << my_rank << " DEBUG] Pass " << invalidation_passes 
+                                       << ": Propagating invalidation from local " << u_local
+                                       << " (global " << u_global << ") to local child " << v_local_child
+                                       << " (global " << local_to_global[v_local_child] << "). Old dist: " << dist[v_local_child] 
+                                       << ", Old parent: " << parent[v_local_child] << std::endl;
+                        }
+                        dist[v_local_child] = INFINITY_WEIGHT;
+                        parent[v_local_child] = -1;
+                        changed_in_local_invalidation_sweep = true;
+                    }
+                }
+            }
+        }
+        if (debug_output && changed_in_local_invalidation_sweep) {
+             std::cout << "[Rank " << my_rank << " DEBUG] Invalidation pass " << invalidation_passes << " caused further local invalidations." << std::endl;
+        }
+    }
+    if (debug_output) {
+         std::cout << "[Rank " << my_rank << " DEBUG] Finished local invalidation propagation in " << invalidation_passes << " passes." << std::endl;
+    }
+
+    // Step 3: Call the iterative relaxation process.
+    // The `initial_affected` flags (which include those from `initial_affected_del`) 
+    // should be used by the underlying update algorithm to know which nodes to start from.
+    if (debug_output) {
+        std::cout << "[Rank " << my_rank << " DEBUG] Starting Distributed_UpdateAffected_MPI_Async/Sync with potentially updated dist/parent arrays..." << std::endl;
+    }
+
+    // Choose one of the update strategies. Assuming Async is preferred.
+    Distributed_UpdateAffected_MPI_Async(
+        local_graph,
+        local_boundary_edges,
+        local_to_global,
+        dist,    // Pass the modified dist array
+        parent,  // Pass the modified parent array
+        my_rank,
+        part,
+        source,  // Pass source_global_id
+        debug_output
     );
+    // Alternatively, call the synchronous version:
+    // Distributed_UpdateAffected_MPI(local_graph, local_boundary_edges, local_to_global, dist, parent, my_rank, part, source, debug_output);
 
-    std::cout << "[Rank " << my_rank << "] Exiting Distributed_DynamicSSSP_MPI." << std::endl;
+    if (debug_output && my_rank == 0) {
+        std::cout << "[Rank 0 DEBUG] Exiting Distributed_DynamicSSSP_MPI." << std::endl;
+    }
 }

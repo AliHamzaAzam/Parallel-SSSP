@@ -297,6 +297,14 @@ int mpi_main(int argc, char* argv[]) {
              if (rank == 0) std::cout << "Skipping partitioning (num_partitions <= 1 or no vertices). Assigning all to partition 0." << std::endl;
              std::fill(part.begin(), part.end(), 0);
         }
+        // Print METIS partition assignments on Rank 0
+        if (rank == 0) {
+            std::cout << "Partition assignments: [";
+            for (size_t i = 0; i < part.size(); ++i) {
+                std::cout << part[i] << (i + 1 < part.size() ? ", " : "");
+            }
+            std::cout << "]" << std::endl;
+        }
 
         // --- Initial Affected Calculation (Algorithm 2 on Rank 0) ---
         // IMPORTANT: This modifies a temporary copy of distances/parents for calculation.
@@ -311,22 +319,38 @@ int mpi_main(int argc, char* argv[]) {
             // Treat INCREASE like DELETE for initial affected_del calculation
             if (change.type == ChangeType::DECREASE || change.type == ChangeType::INSERT) continue;
 
-            // Check if edge e(u, v) was in the original SSSP tree T
-            // Note: This check assumes an undirected graph representation in the parent array
-            // or that the edge direction matches parent relationship.
-            // If the graph is stored undirected, you might need:
-            // bool in_tree = (temp_sssp_result.parent[change.v] == change.u) || (temp_sssp_result.parent[change.u] == change.v);
-
-            if (temp_sssp_result.parent[change.v] == change.u) {
-                 int v = change.v;
-                 // y = argmax_{x in {u,v}} {Dist[x]}
-                 // We mark the child node 'v' as affected if the edge (u,v) from parent u is deleted/increased.
-                 int y = v; // The vertex whose distance might become infinite due to parent edge removal
-                 if (temp_sssp_result.dist[y] != INFINITY_WEIGHT) { // Only mark if reachable
-                     temp_sssp_result.dist[y] = INFINITY_WEIGHT; // Change Dist[y] to infinity in the *temporary* result
-                     affected_del[y] = true;
-                     affected[y] = true;
-                 }
+            int u = change.u;
+            int v = change.v;
+            int y = -1;
+            // Identify which endpoint was the child in the original SSSP tree
+            if (v >= 0 && v < temp_sssp_result.parent.size() && temp_sssp_result.parent[v] == u) {
+                y = v;
+            } else if (u >= 0 && u < temp_sssp_result.parent.size() && temp_sssp_result.parent[u] == v) {
+                y = u;
+            }
+            // If a child was found and reachable, invalidate it
+            if (y != -1 && temp_sssp_result.dist[y] != INFINITY_WEIGHT) {
+                temp_sssp_result.dist[y] = INFINITY_WEIGHT;
+                affected_del[y] = true;
+                affected[y] = true;
+            }
+        }
+        // Propagate deletion invalidations down the SSSP tree to all descendants
+        {
+            bool changed = true;
+            int n = temp_sssp_result.parent.size();
+            while (changed) {
+                changed = false;
+                for (int i = 0; i < n; ++i) {
+                    int p = temp_sssp_result.parent[i];
+                    if (p >= 0 && affected_del[p] && !affected_del[i]) {
+                        // If parent invalidated, invalidate child
+                        temp_sssp_result.dist[i] = INFINITY_WEIGHT;
+                        affected_del[i] = true;
+                        affected[i] = true;
+                        changed = true;
+                    }
+                }
             }
         }
 
@@ -737,7 +761,77 @@ int mpi_main(int argc, char* argv[]) {
 
     MPI_Barrier(MPI_COMM_WORLD); // Wait for all ranks to finish setup/receive
     if (rank == 0) std::cout << "All ranks finished data setup/scattering." << std::endl;
-    // End local data receive/setup section
+
+    // Apply structural changes: remove deleted/increased edges or insert new/decreased edges
+    for (const auto& change : changes) {
+        int ug = change.u, vg = change.v;
+        int ul = (ug >= 0 && ug < global_to_local.size()) ? global_to_local[ug] : -1;
+        int vl = (vg >= 0 && vg < global_to_local.size()) ? global_to_local[vg] : -1;
+        // DELETE or INCREASE: remove edge
+        if (change.type == ChangeType::DELETE || change.type == ChangeType::INCREASE) {
+            if (ul != -1 && vl != -1) {
+                local_graph.remove_edge(ul, vl);
+                local_graph.remove_edge(vl, ul);
+            }
+            // Remove from incoming boundary edges if present
+            // Remove incoming boundary edges for both local endpoints
+            if (vl != -1) {
+                auto it = local_boundary_edges.find(vl);
+                if (it != local_boundary_edges.end()) {
+                    auto& vec = it->second;
+                    vec.erase(std::remove_if(vec.begin(), vec.end(), [&](const Edge& e){ return e.to == ug; }), vec.end());
+                }
+            }
+            if (ul != -1) {
+                auto it2 = local_boundary_edges.find(ul);
+                if (it2 != local_boundary_edges.end()) {
+                    auto& vec2 = it2->second;
+                    vec2.erase(std::remove_if(vec2.begin(), vec2.end(), [&](const Edge& e){ return e.to == vg; }), vec2.end());
+                }
+            }
+        }
+        // INSERT or DECREASE: add edge
+        else if (change.type == ChangeType::INSERT || change.type == ChangeType::DECREASE) {
+            if (ul != -1 && vl != -1) {
+                local_graph.add_edge(ul, vl, change.weight);
+                local_graph.add_edge(vl, ul, change.weight);
+            } else if (vl != -1 && ul == -1) {
+                // boundary edge incoming to vl
+                local_boundary_edges[vl].push_back({ug, change.weight});
+            } else if (ul != -1 && vl == -1) {
+                // boundary edge incoming to ul
+                local_boundary_edges[ul].push_back({vg, change.weight});
+            }
+        }
+    }
+    // Debug: verify deletions removed
+    if (debug_output) {
+        for (const auto& change : changes) {
+            if (change.type == ChangeType::DELETE || change.type == ChangeType::INCREASE) {
+                int ug = change.u, vg = change.v;
+                int ul = (ug >= 0 && ug < global_to_local.size()) ? global_to_local[ug] : -1;
+                int vl = (vg >= 0 && vg < global_to_local.size()) ? global_to_local[vg] : -1;
+                bool still_exists = false;
+                if (ul != -1 && vl != -1) {
+                    // internal edge
+                    still_exists = local_graph.has_edge(ul, vl) || local_graph.has_edge(vl, ul);
+                } else if (ul != -1) {
+                    auto it = local_boundary_edges.find(ul);
+                    if (it != local_boundary_edges.end()) {
+                        for (const auto& e : it->second) if (e.to == vg) still_exists = true;
+                    }
+                } else if (vl != -1) {
+                    auto it = local_boundary_edges.find(vl);
+                    if (it != local_boundary_edges.end()) {
+                        for (const auto& e : it->second) if (e.to == ug) still_exists = true;
+                    }
+                }
+                if (still_exists) {
+                    std::cerr << "[Rank " << rank << "] WARNING: Deleted edge (" << ug << "," << vg << ") still present in data structures." << std::endl;
+                }
+            }
+        }
+    }
 
     // --- Distributed Update ---
     if (rank == 0) std::cout << "Starting distributed update phase..." << std::endl;
