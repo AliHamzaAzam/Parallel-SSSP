@@ -67,6 +67,18 @@ void Distributed_IdentifyAffected_MPI(
     }
 }
 
+// Forward declaration for asynchronous update variant (Algorithm 4)
+void Distributed_UpdateAffected_MPI_Async(
+    const Graph& local_graph,
+    const BoundaryEdges& local_boundary_edges,
+    const std::vector<int>& local_to_global,
+    std::vector<double>& dist,
+    std::vector<int>& parent,
+    int my_rank,
+    const std::vector<int>& part,
+    bool debug_output
+);
+
 // Distributed_UpdateAffected_MPI: iteratively relax local and boundary edges across ranks
 // Inputs:
 //   local_graph           : subgraph owned by this rank
@@ -88,15 +100,15 @@ void Distributed_UpdateAffected_MPI(
 ) {
     int n_local = local_graph.num_vertices;
     int n_global = part.size(); // Get global size from partition array
-    
+
     // Safety check to prevent allocation of very large buffers
     if (n_global > 1000000) {
         if (my_rank == 0) {
-            std::cerr << "WARNING: Very large global vertex count: " << n_global 
+            std::cerr << "WARNING: Very large global vertex count: " << n_global
                       << ". This may cause memory issues." << std::endl;
         }
     }
-    
+
     if (my_rank == 0) std::cout << "[Rank 0] UpdateAffected: Starting. n_local=" << n_local << ", n_global=" << n_global << std::endl;
 
     bool local_changed_in_iter = true;
@@ -105,16 +117,25 @@ void Distributed_UpdateAffected_MPI(
     // Allocate buffers with safety checks
     std::vector<double> send_dist_buffer;
     std::vector<double> current_global_dist;
-    
+
     try {
         // Buffer to hold distances from this rank to be sent in Allreduce
         send_dist_buffer.resize(n_global, INFINITY_WEIGHT);
         // Buffer to receive the minimum distances across all ranks for all global vertices
         current_global_dist.resize(n_global, INFINITY_WEIGHT);
     } catch (const std::bad_alloc& e) {
-        std::cerr << "[Rank " << my_rank << "] ERROR: Memory allocation failed: " << e.what() 
+        std::cerr << "[Rank " << my_rank << "] ERROR: Memory allocation failed: " << e.what()
                   << ". Try reducing problem size or using more processes." << std::endl;
         MPI_Abort(MPI_COMM_WORLD, 1);
+        return;
+    }
+
+    // Check for asynchronous update variant via environment variable
+    if (char* async_env = getenv("SSSP_ASYNC"); async_env != nullptr &&
+        (strcmp(async_env, "1") == 0 || strcmp(async_env, "true") == 0 || strcmp(async_env, "yes") == 0)) {
+        if (my_rank == 0) std::cout << "[Rank 0] Using asynchronous update variant (Algorithm 4)" << std::endl;
+        Distributed_UpdateAffected_MPI_Async(local_graph, local_boundary_edges, local_to_global,
+                                            dist, parent, my_rank, part, debug_output);
         return;
     }
 
@@ -222,10 +243,10 @@ void Distributed_UpdateAffected_MPI(
              if (my_rank == 0) std::cerr << "Warning: UpdateAffected reached max iterations (" << iteration << "). Potential issue or slow convergence?" << std::endl;
              break;
         }
-        
+
         // Secondary safeguard to prevent excessive iterations
         if (iteration > 1000) {
-            std::cerr << "[Rank " << my_rank << "] WARNING: Excessive iterations reached (" << iteration 
+            std::cerr << "[Rank " << my_rank << "] WARNING: Excessive iterations reached (" << iteration
                       << "). Forcing termination." << std::endl;
             MPI_Abort(MPI_COMM_WORLD, 1);
             return;
@@ -233,6 +254,86 @@ void Distributed_UpdateAffected_MPI(
     } // end while loop
 
     std::cout << "[Rank " << my_rank << "] UpdateAffected: Finished after " << iteration << " iterations." << std::endl;
+}
+
+// Asynchronous variant (Algorithm 4): non-blocking allreduce overlapped with local relaxations
+void Distributed_UpdateAffected_MPI_Async(
+    const Graph& local_graph,
+    const BoundaryEdges& local_boundary_edges,
+    const std::vector<int>& local_to_global,
+    std::vector<double>& dist,
+    std::vector<int>& parent,
+    int my_rank,
+    const std::vector<int>& part,
+    bool debug_output
+) {
+    int n_local = local_graph.num_vertices;
+    int n_global = part.size();
+    std::vector<double> send_buf(n_global, INFINITY_WEIGHT);
+    std::vector<double> global_buf(n_global, INFINITY_WEIGHT);
+    MPI_Request req;
+    bool local_changed = true;
+    int iteration = 0;
+
+    while (true) {
+        iteration++;
+        // prepare send buffer from local dist
+        std::fill(send_buf.begin(), send_buf.end(), INFINITY_WEIGHT);
+        for (int u_local = 0; u_local < n_local; ++u_local) {
+            int u_global = local_to_global[u_local];
+            if (u_global >= 0 && u_global < n_global) send_buf[u_global] = dist[u_local];
+        }
+        // start non-blocking allreduce
+        MPI_Iallreduce(send_buf.data(), global_buf.data(), n_global, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD, &req);
+
+        // local relaxations using current global_buf (stale values)
+        local_changed = false;
+        for (int u_local = 0; u_local < n_local; ++u_local) {
+            double du = dist[u_local];
+            if (du == INFINITY_WEIGHT) continue;
+            // internal edges
+            for (const auto& e : local_graph.neighbors(u_local)) {
+                if (du + e.weight < dist[e.to]) {
+                    dist[e.to] = du + e.weight;
+                    parent[e.to] = local_to_global[u_local];
+                    local_changed = true;
+                }
+            }
+            // boundary edges
+            if (auto it = local_boundary_edges.find(u_local); it != local_boundary_edges.end()) {
+                for (const auto& be : it->second) {
+                    int g_to = be.to;
+                    double w = be.weight;
+                    if (global_buf[g_to] + w < dist[u_local]) {
+                        dist[u_local] = global_buf[g_to] + w;
+                        parent[u_local] = g_to;
+                        local_changed = true;
+                    }
+                }
+            }
+        }
+
+        // wait for global reduction result
+        MPI_Wait(&req, MPI_STATUS_IGNORE);
+        // update local dist with fresh global_buf
+        for (int u_local = 0; u_local < n_local; ++u_local) {
+            int u_global = local_to_global[u_local];
+            double gd = global_buf[u_global];
+            if (gd < dist[u_local]) {
+                dist[u_local] = gd;
+                parent[u_local] = u_global;
+                local_changed = true;
+            }
+        }
+
+        // convergence check across ranks
+        int flag = local_changed ? 1 : 0;
+        int global_flag = 0;
+        MPI_Allreduce(&flag, &global_flag, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        if (global_flag == 0) break;
+        if (iteration > n_global + 1) break;
+    }
+    if (my_rank == 0) std::cout << "[Rank 0] Async UpdateAffected finished in " << iteration << " iterations." << std::endl;
 }
 
 // Distributed_DynamicSSSP_MPI: top-level driver for dynamic SSSP update per rank
@@ -308,4 +409,3 @@ void Distributed_DynamicSSSP_MPI(
 
     std::cout << "[Rank " << my_rank << "] Exiting Distributed_DynamicSSSP_MPI." << std::endl;
 }
-

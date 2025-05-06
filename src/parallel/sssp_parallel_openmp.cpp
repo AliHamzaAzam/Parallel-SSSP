@@ -125,6 +125,73 @@ void UpdateAffectedVertices_OpenMP(
     }
 }
 
+// Asynchronous relaxations using OpenMP tasks (Algorithm 4)
+void AsyncUpdateAffectedVertices_OpenMP(
+    const Graph& G,
+    SSSPResult& T,
+    std::vector<std::atomic<bool>>& Affected)
+{
+    #pragma omp parallel
+    {
+        #pragma omp single nowait
+        {
+            // Spawn initial tasks for affected vertices
+            for (int v = 0; v < G.num_vertices; ++v) {
+                if (Affected[v].load(std::memory_order_relaxed)) {
+                    Affected[v].store(false, std::memory_order_relaxed);
+                    #pragma omp task firstprivate(v)
+                    {
+                        // Process vertex v and propagate relaxations
+                        std::vector<int> stack = {v};
+                        while (!stack.empty()) {
+                            int curr = stack.back();
+                            stack.pop_back();
+                            for (const auto& e : G.neighbors(curr)) {
+                                int u = e.to;
+                                Weight newd = T.dist[curr] + e.weight;
+                                double oldd;
+                                #pragma omp atomic read
+                                oldd = T.dist[u];
+                                if (newd < oldd) {
+                                    #pragma omp atomic write
+                                    T.dist[u] = newd;
+                                    #pragma omp atomic write
+                                    T.parent[u] = curr;
+                                    // Schedule propagation for u if not already scheduled
+                                    if (!Affected[u].exchange(true, std::memory_order_relaxed)) {
+                                        #pragma omp task firstprivate(u)
+                                        {
+                                            stack.push_back(u);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        #pragma omp taskwait
+        }
+    }
+}
+
+// Asynchronous batch update: apply structural changes then async dynamic update
+void AsyncBatchUpdate_OpenMP(
+    const Graph& G,
+    SSSPResult& T,
+    const std::vector<EdgeChange>& changes)
+{
+    int n = G.num_vertices;
+    if (n == 0) return;
+    std::vector<std::atomic<bool>> Affected(n), Affected_Del(n);
+    for (int i = 0; i < n; ++i) {
+        Affected[i].store(false, std::memory_order_relaxed);
+        Affected_Del[i].store(false, std::memory_order_relaxed);
+    }
+    ProcessChanges_OpenMP(G, changes, T, Affected_Del, Affected);
+    AsyncUpdateAffectedVertices_OpenMP(G, T, Affected);
+}
+
 // BatchUpdate_OpenMP: full update sequence for a batch of changes
 // - runs ProcessChanges then UpdateAffectedVertices
 void BatchUpdate_OpenMP(
@@ -149,8 +216,8 @@ void TestDynamicSSSPWorkflow_OpenMP(
     SSSPResult& T,
     const std::vector<EdgeChange>& changes)
 {
-    BatchUpdate_OpenMP(G, T, changes);
-    std::cout << "--- After OpenMP Dynamic SSSP ---\n";
+    std::cout << "--- After OpenMP Dynamic SSSP (Asynchronous Algorithm 4) ---\n";
+    AsyncBatchUpdate_OpenMP(G, T, changes);
     for (int i = 0; i < G.num_vertices; ++i) {
         std::cout << "Vertex " << i << ": Dist=" << T.dist[i]
                   << ", Parent=" << T.parent[i] << '\n';

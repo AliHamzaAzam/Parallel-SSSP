@@ -33,7 +33,7 @@ int parallel_main(int argc, char* argv[]) {
         num_threads = std::stoi(argv[2]);    // Parse num_threads
         num_partitions = std::stoi(argv[3]); // Parse num_partitions
         if (argc > 4) {
-            changes_file = argv[4];          // Correct index for changes_file
+            changes_file = argv[4];             // Correct index for changes_file
         }
     } catch (const std::exception& e) {
         std::cerr << "Error parsing arguments in parallel_main: " << e.what() << std::endl;
