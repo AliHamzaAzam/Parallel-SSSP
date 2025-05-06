@@ -43,7 +43,7 @@ void print_sssp_result(const SSSPResult& sssp_result) {
 // Forward declarations for the three main entry points
 int serial_main(int argc, char* argv[]);
 int parallel_main(int argc, char* argv[]);
-int mpi_main(int argc, char* argv[]);
+int mpi_main(int argc, char* argv[], bool hybrid);
 
 int main(int argc, char* argv[]) {
 
@@ -73,7 +73,8 @@ int main(int argc, char* argv[]) {
 
     if (mode == "serial") return serial_main(argc, argv);
     if (mode == "openmp" || mode == "parallel") return parallel_main(argc, argv);
-    if (mode == "mpi") return mpi_main(argc, argv);
+    if (mode == "mpi") return mpi_main(argc, argv, false);
+    if (mode == "mpi_openmp") return mpi_main(argc, argv, true);  
     std::cerr << "Unknown mode: " << mode << std::endl;
     return 1;
 }

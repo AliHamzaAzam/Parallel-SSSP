@@ -15,6 +15,7 @@
 #include <map>
 #include <cstdlib>
 #include <cstring>
+#include <omp.h>
 
 #include "../../include/graph.hpp"
 #include "../../include/utils.hpp"
@@ -167,11 +168,21 @@ void setup_local_data(
 // perform initial Dijkstra on rank 0, partition graph, compute initial affected set,
 // distribute subgraphs to worker ranks, invoke Distributed_DynamicSSSP_MPI,
 // and gather and print final results on rank 0.
-int mpi_main(int argc, char* argv[]) {
+int mpi_main(int argc, char* argv[], bool hybrid) {
     MPI_Init(&argc, &argv);
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Set OpenMP threads per process based on hybrid flag
+    if (hybrid) {
+        int threads = omp_get_max_threads();
+        omp_set_num_threads(threads);
+        if (rank == 0) std::cout << "Hybrid MPI+OpenMP mode: " << threads << " threads per rank." << std::endl;
+    } else {
+        omp_set_num_threads(1);
+        if (rank == 0) std::cout << "Pure MPI mode: OpenMP disabled (1 thread per rank)." << std::endl;
+    }
 
     // Add debug flag to control verbose output
     bool debug_output = false;
