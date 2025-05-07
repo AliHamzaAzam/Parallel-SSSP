@@ -404,6 +404,10 @@ int mpi_main(int argc, char* argv[], bool hybrid) {
     std::vector<bool> local_affected_del;
     std::vector<bool> local_affected;
 
+    // Start timing graph distribution (setup/scattering)
+    double distribution_time_ms = 0.0;
+    auto start_distribution = MPI_Wtime();
+
     // --- Setup Local Data (Rank 0) ---
     if (rank == 0) {
         std::cout << "[Rank 0] Starting setup for own local data..." << std::endl;
@@ -771,6 +775,9 @@ int mpi_main(int argc, char* argv[], bool hybrid) {
     }
 
     MPI_Barrier(MPI_COMM_WORLD); // Wait for all ranks to finish setup/receive
+    auto end_distribution = MPI_Wtime();
+    distribution_time_ms = (end_distribution - start_distribution) * 1000.0;
+    if (rank == 0) std::cout << "Graph distribution phase finished in " << distribution_time_ms << " ms." << std::endl;
     if (rank == 0) std::cout << "All ranks finished data setup/scattering." << std::endl;
 
     // Apply structural changes: remove deleted/increased edges or insert new/decreased edges
@@ -993,7 +1000,8 @@ int mpi_main(int argc, char* argv[], bool hybrid) {
 
         std::cout << "\n--- Timings (MPI) ---" << std::endl;
         std::cout << "Initial SSSP (Rank 0): " << initial_sssp_time_rank0.count() << " ms" << std::endl;
-        std::cout << "Distributed Update Time: " << update_time_ms << " ms" << std::endl;
+        std::cout << "Graph distribution (MPI): " << distribution_time_ms << " ms" << std::endl;
+        std::cout << "Distributed Update Time (excluding graph distribution): " << update_time_ms << " ms" << std::endl;
         std::cout << "\nExecution finished." << std::endl;
     }
 

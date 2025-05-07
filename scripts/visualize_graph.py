@@ -102,7 +102,7 @@ def main():
         g0.attr(rankdir='LR'); g0.node_attr.update(shape='circle')
         # annotate each vertex with its computed min-cost
         for n, c in dist0.items():
-            g0.node(str(n), label=f"{n}\n{c}")
+            g0.node(str(n), label=f"{n}\n{round(c, 2)}")
         for u, v, w in edges:
             u_i, v_i = int(u), int(v)
             # highlight undirected tree edges in either direction
@@ -111,12 +111,12 @@ def main():
             else:
                 g0.edge(u, v, label=w, color='gray')
         dot0 = args.output + '_original.dot'; g0.save(dot0); print(f'Written original DOT: {dot0}')
-        if args.render: out0 = g0.render(filename=args.output + '_originagit status --porcelainl', cleanup=False); print(f'Rendered original PNG: {out0}')
+        if args.render: out0 = g0.render(filename=args.output + '_original', cleanup=False); print(f'Rendered original PNG: {out0}')
         # write updated
         g1 = Graph(comment=f'Updated from {args.updates}', format='png')
         g1.attr(rankdir='LR'); g1.node_attr.update(shape='circle')
         for n, c in dist1.items():
-            g1.node(str(n), label=f"{n}\n{c}")
+            g1.node(str(n), label=f"{n}\n{round(c, 2)}")
         for u, v, w in edges_updated:
             u_i, v_i = int(u), int(v)
             # highlight undirected updated tree edges
@@ -131,7 +131,7 @@ def main():
     g = Graph(comment=f'Graph from {args.input}', format='png')
     g.attr(rankdir='LR'); g.node_attr.update(shape='circle')
     for n, c in dist0.items():
-        g.node(str(n), label=f"{n}\n{c}")
+        g.node(str(n), label=f"{n}\n{round(c, 2)}")
     for u, v, w in edges:
         u_i, v_i = int(u), int(v)
         # highlight undirected tree edges in either direction

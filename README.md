@@ -25,6 +25,25 @@ A utility to generate random edge-change sequences and a suite of benchmarking a
 
 ---
 
+## Hardware Specifications
+
+The implementations were tested on a small heterogeneous cluster consisting of two laptops:
+
+### MacBook Pro (M3 Pro)
+- **Model**: MacBook Pro (Mac15,6 / Model Number: MRX33LL/A)
+- **Processor**: Apple M3 Pro with 11 cores (5 performance and 6 efficiency cores)
+- **Memory**: 18 GB unified memory
+- **Role**: Used for serial and OpenMP implementations, as well as hosting MPI ranks
+
+### Windows Laptop (AMD Ryzen)
+- **Processor**: AMD Ryzen 7 5800H with Radeon Graphics, 3.2 GHz, 8 cores / 16 logical processors
+- **Memory**: 16 GB DDR4
+- **Role**: Secondary machine in the MPI cluster
+
+The two machines were networked via ZeroTier VPN to create a virtual network for the distributed MPI implementation. Serial and OpenMP experiments were conducted exclusively on the MacBook Pro, while MPI and hybrid MPI+OpenMP experiments utilized both machines in the cluster.
+
+---
+
 ## Directory Structure
 
 ```text
