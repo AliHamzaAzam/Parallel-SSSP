@@ -200,7 +200,7 @@ pdftotext -layout Project_Report_Parallel_SSSP.pdf web/raw/report.txt
 cd web && npm run data && npm test && npm run build
 ```
 
-The generator fails if the report page structure, exact evidence statements or MPI rank attribution are missing or inconsistent. `rawSha256` records which extracted text produced the JSON. Each observation records its printed report page; MPI rank attribution comes from page 20, while endpoint speedups are from page 36. No values are estimated from raster plot images. Source text and output JSON are committed so routine builds need only Python 3 and Node.js 20.19+ or 22.12+.
+The generator fails if the report page structure, exact evidence statements or MPI rank attribution are missing or inconsistent. `rawSha256` and `pdfSha256` identify the reviewed text/PDF pair. Generation checks both against pinned hashes before writing, rejects changed dataset context, and replaces the JSON atomically so failed writes preserve the previous output. If the PDF or extraction changes, recheck the source pages, dataset, hardware context and all displayed claims before deliberately updating `PDF_SHA256` and `RAW_SHA256` in `web/scripts/generate_data.py`. Formatting changes from a different `pdftotext` version also require review; never update the hashes just to bypass a failure. Each observation records its printed report page; MPI rank attribution comes from page 20, while endpoint speedups are from page 36. No values are estimated from raster plot images. Source text and output JSON are committed so routine builds need only Python 3 and Node.js 20.19+ or 22.12+.
 
 For a headless browser check against a served production build, use an already approved Playwright installation and Chrome:
 

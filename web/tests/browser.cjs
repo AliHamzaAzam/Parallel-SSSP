@@ -22,6 +22,8 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
       ]);
       const widths = await page.locator('.bar').evaluateAll(bars => bars.map(bar => parseFloat(bar.style.width)));
       assert.deepEqual(widths, [32.25, 90.15]);
+      assert(widths.every(value => Number.isFinite(value) && value >= 0 && value <= 100));
+      assert.equal(await page.locator('.chart').getAttribute('aria-label'), 'At 100,000 updates, MPI reports 6.45 times speedup and MPI plus OpenMP reports 18.03 times speedup.');
       assert.equal(await page.locator('svg[role="img"] title').count(), 1);
       assert.equal(await page.locator('.table-wrap').getAttribute('tabindex'), '0');
       assert.equal(await page.locator('.table-wrap').getAttribute('aria-label'), 'Recorded observations, scroll horizontally for all columns');
@@ -33,12 +35,23 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
       await page.locator('nav a[href="#results"]').click();
       assert.equal(new URL(page.url()).hash, '#results');
+      if (width < 660) {
+        await page.locator('.table-wrap').focus();
+        await page.keyboard.press('ArrowRight');
+        await page.waitForFunction(() => document.querySelector('.table-wrap').scrollLeft > 0);
+      }
+      await page.emulateMedia({ reducedMotion: 'reduce' });
+      assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).scrollBehavior), 'auto');
       for (const href of await page.locator('a[href*="/assets/"]').evaluateAll(nodes => nodes.map(node => node.href))) {
         assert.equal((await page.request.get(href)).status(), 200);
       }
       await page.screenshot({ path: `/tmp/sssp-results-${width}.png`, fullPage: true });
       await page.close();
     }
+    const noScript = await browser.newPage({ javaScriptEnabled: false });
+    await noScript.goto(process.env.SITE_URL || 'http://localhost:4174');
+    assert.match(await noScript.locator('body').innerText(), /Enable JavaScript/);
+    await noScript.close();
     assert.deepEqual(errors, []);
     console.log('PASS: production build at desktop/mobile, chart/table content, navigation, linked evidence, no overflow or page errors');
   } finally { await browser.close(); }

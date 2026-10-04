@@ -2,6 +2,7 @@
   "dataset": "bio-human-gene2",
   "source": "Project_Report_Parallel_SSSP.pdf",
   "rawSha256": "dc77a9d6fab87e9629aabceb21ecc60faa79ad93fd15caf822c487e102c3075d",
+  "pdfSha256": "e796d287ca6340d61b3e0355ba6940ba85fa9beda90c37850c13b53af7204b98",
   "measurementKind": "Reported speedup over serial; not independently reproduced",
   "points": [
     {
