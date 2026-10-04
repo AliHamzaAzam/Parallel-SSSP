@@ -176,3 +176,39 @@ Contributions are welcome! Please open issues or pull requests. Ensure code styl
 ## License
 
 This project is provided under the MIT License. See [LICENSE](LICENSE) for details, or contact the maintainers if no license file is present.
+
+## Results site
+
+`web/` is a static Vite + vanilla TypeScript notebook. It presents four observations explicitly stated in the checked-in project report. The site labels historical hardware, missing runtime/variance/compiler data, and the unusual OpenMP result. No report numbers are new benchmark measurements. Runtime and efficiency charts are intentionally absent because their evidence is incomplete.
+
+```bash
+cd web
+npm ci --ignore-scripts
+npm run data       # Extract validated report statements into data/results.json
+npm test           # Source, values, missing-evidence and regeneration checks
+npm run typecheck
+npm run build
+npm run preview    # Serve dist/ at http://localhost:4173
+```
+
+Development: `npm run dev`. Vite uses relative asset URLs so the built site can be hosted below a path prefix. The original PDF and extracted source text are bundled for readers.
+
+To refresh the raw extraction from the repository root (requires `pdftotext`):
+
+```bash
+pdftotext -layout Project_Report_Parallel_SSSP.pdf web/raw/report.txt
+cd web && npm run data && npm test && npm run build
+```
+
+The generator fails if the report page structure, exact evidence statements or MPI rank attribution are missing or inconsistent. `rawSha256` records which extracted text produced the JSON. Each observation records its printed report page; MPI rank attribution comes from page 20, while endpoint speedups are from page 36. No values are estimated from raster plot images. Source text and output JSON are committed so routine builds need only Python 3 and Node.js 20.19+ or 22.12+.
+
+For a headless browser check against a served production build, use an already approved Playwright installation and Chrome:
+
+```bash
+cd web
+npm run preview -- --port 4174
+# In another terminal, from web/:
+PLAYWRIGHT_MODULE=/path/to/playwright CHROME_BIN=/path/to/chromium node tests/browser.cjs
+```
+
+The browser check covers desktop and 320/390 px mobile viewports, rendered observations, chart bars, evidence links, anchor navigation, horizontal overflow and browser errors. `SITE_URL` overrides the default `http://localhost:4174`.
